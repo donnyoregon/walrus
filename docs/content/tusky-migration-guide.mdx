@@ -4,6 +4,8 @@ description: During the Tusky sunsetting period, you can continue reading your d
 keywords: [ tusky, migration, migrate from tusky, tusky sunset, data migration ] 
 ---
 
+{/* https://linear.app/mysten-labs/issue/DOCS-656/tusky-migration-guide */}
+
 As of December 19, 2025, the storage service Tusky is shutting down. Data stored on Walrus through Tusky is still safe and accessible. During Tusky's sunsetting period, you can continue reading your data, however you must either migrate to using Walrus directly or through alternative tooling.
 
 During this sunset period, you must:
@@ -25,8 +27,8 @@ During this sunset period, you must:
 ## Immediate first steps 
 
 1. Take note of the sunset window.
-   - You have at least **30 days** (until January 19, 2025) of guaranteed read access via Tusky from the date of their shut down announcement.
-   - **Do not wait until the last week of this 30 day window**.
+   - You have until March 19, 2026 of guaranteed read access via Tusky from the date of their shut down announcement.
+   - **Do not wait until the last week of this window**.
 2. Take inventory of your data. Having an inventory of your data will help determine which migration option fits best.
    - Make a list of:
      - [Vaults and buckets](https://docs.tusky.io/http-api#tag/vaults/get/vaults)
@@ -38,9 +40,9 @@ During this sunset period, you must:
 
 ## Important note on encryption (applies to all migration options)
 
-Tusky supports self-hosted keys and keys supplied by the user but [stored on Tusky and password protected](https://github.com/tusky-io/ts-sdk?tab=readme-ov-file#encryption). They implement server-side encryption and decryption of blobs with those keys, which means that a user or app client does not need to do the actual encryption or decryption on their end. 
+Tusky supports self-hosted keys and keys supplied by the user but [stored encrypted on Tusky and password protected](https://github.com/tusky-io/ts-sdk?tab=readme-ov-file#encryption). All encryption and decryption of blobs happens on the client side and is handled by Tusky SDK.
 
-**This means once you download your data from Tusky, it should already be decrypted.**
+**This means once you download your data from Tusky via SDK, it should already be decrypted.**
 
 Based on your needs for data management going forward, you can choose to encrypt your data using an alternative mechanism as mentioned in the migration options. If you request the Tusky-stored encryption keys from them before they shut down the service, you may choose to reuse those keys with the relevant alternatives.
 
@@ -50,10 +52,10 @@ Based on your needs for data management going forward, you can choose to encrypt
   - Use the Tusky app, HTTP API, or SDK for bulk export. [Refer to the Tusky documentation for more information](https://docs.tusky.io/tusky-shutdown/tusky-shutting-down-how-to-retrieve-your-data) or view the [video tutorial](https://www.youtube.com/watch?v=2cur04QKUCA).
 
 2. Set up a Walrus client
-  - Install Walrus [CLI](/docs/usage/client-cli) or [SDK](/docs/usage/sdks), or use the [web API](/docs/usage/web-api): https://docs.wal.app/docs/usage/started 
+  - Install Walrus [CLI](/docs/walrus-client/storing-blobs) or [SDK](/docs/typescript-sdk/sdks), or use the [web API](/docs/http-api/storing-blobs): https://docs.wal.app/docs/getting-started 
 
 3. Re-upload to Walrus
-  - Use the [CLI](/docs/usage/client-cli), [SDK](/docs/usage/sdks), or [web API](/docs/usage/web-api).
+  - Use the [CLI](/docs/walrus-client/storing-blobs), [SDK](/docs/typescript-sdk/sdks), or [web API](/docs/http-api/storing-blobs).
 
   - For encryption, either:
     - Use a third-party library (like [CryptoES](https://www.npmjs.com/package/crypto-es) or [Node’s Crypto Module](https://medium.com/@tony.infisical/guide-to-nodes-crypto-module-for-encryption-decryption-65c077176980) for symmetric key based encryption before upload. You can optionally use the keys that you might have retrieved from Tusky.
@@ -65,10 +67,10 @@ Based on your needs for data management going forward, you can choose to encrypt
 1. Extract blob or patch IDs and metadata from Tusky (through their app, API, or SDK).
 
 2. Fetch blobs or quilt patches directly from Walrus using:
-  - [Walrus CLI](/docs/usage/client-cli)
-  - [Walrus HTTP API](/docs/usage/web-api)
-  - [Walrus SDKs](/docs/usage/sdks)
-  - [Walrus Quilt](/docs/usage/quilt)
+  - [Walrus CLI](/docs/walrus-client/storing-blobs)
+  - [Walrus HTTP API](/docs/http-api/storing-blobs)
+  - [Walrus SDKs](/docs/typescript-sdk/sdks)
+  - [Walrus Quilt](/docs/system-overview/quilt)
 
 3. Validate integrity and availability of the data.
   - You might have to decrypt your data using encryption keys that you have retrieved from Tusky. Make sure you request these **before** their service is shut down.
@@ -80,7 +82,7 @@ Based on your needs for data management going forward, you can choose to encrypt
 Available options:
 
   - [Nami Cloud](https://docs.nami.cloud/introduction)
-  - [Zark Lab](https://zarklab.ai): Refer to the [Getting Started with Zark guide](./zark.pdf).
+  - [Zark Lab](https://zarklab.ai): Refer to the [Getting Started with Zark guide](https://zarklab.mintlify.app/data-storage/walrus/walrus-integration-overview).
   - [Pawtato](https://pawtato.app/board/walrus/upload)
 
 :::tip

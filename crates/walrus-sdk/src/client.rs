@@ -4,12 +4,12 @@
 //! Low-level client for use when communicating directly with Walrus nodes.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fmt::{Debug, Display},
     marker::PhantomData,
     num::NonZeroU16,
     path::PathBuf,
-    pin::pin,
+    pin::{Pin, pin},
     sync::{
         Arc,
         OnceLock,
@@ -31,7 +31,7 @@ use rayon::{iter::IntoParallelIterator, prelude::*};
 use sui_types::base_types::ObjectID;
 use tokio::{
     sync::{Mutex, Semaphore},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -44,10 +44,14 @@ use walrus_core::{
     ShardIndex,
     Sliver,
     SliverIndex,
+    SliverType,
     bft,
+    by_axis::ByAxis,
     encoding::{
         ConsistencyCheckType,
         DecodeError,
+        DecodingSymbol,
+        EitherDecodingSymbol,
         EncodingAxis,
         EncodingConfig,
         EncodingConfigEnum,
@@ -60,7 +64,7 @@ use walrus_core::{
     messages::{BlobPersistenceType, ConfirmationCertificate, SignedStorageConfirmation},
     metadata::{BlobMetadataApi as _, VerifiedBlobMetadataWithId},
 };
-use walrus_storage_node_client::{UploadIntent, api::BlobStatus};
+use walrus_storage_node_client::{UploadIntent, api::BlobStatus, error::NodeError};
 use walrus_sui::{
     client::{CertifyAndExtendBlobResult, ExpirySelectionPolicy, ReadClient, SuiContractClient},
     types::{
@@ -83,6 +87,7 @@ use crate::{
             BlobPendingCertifyAndExtend,
             BlobWithStatus,
             EncodedBlob,
+            RegisteredBlob,
             UnencodedBlob,
             WalrusStoreBlobFinished,
             WalrusStoreBlobMaybeFinished,
@@ -97,7 +102,7 @@ use crate::{
         upload_relay_client::UploadRelayClient,
     },
     config::CommunicationLimits,
-    error::{ClientError, ClientErrorKind, ClientResult, StoreError},
+    error::{ClientError, ClientErrorKind, ClientResult, ReconstructSliverError, StoreError},
     uploader::{DistributedUploader, RunOutput, TailHandling, UploaderEvent},
     utils::{
         self,
@@ -112,6 +117,7 @@ use crate::{
 pub mod byte_range_read_client;
 pub mod client_types;
 pub mod communication;
+pub mod streaming;
 pub use communication::NodeCommunicationFactory;
 pub mod metrics;
 pub mod quilt_client;
@@ -132,6 +138,12 @@ pub use crate::{
 /// The delay between retries when retrieving slivers.
 #[allow(unused)]
 const RETRIEVE_SLIVERS_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Maximum number of re-upload rounds when retrying missing confirmations.
+///
+/// This is a best-effort retry to handle cases like cache eviction; callers may also be in a
+/// degraded environment (e.g., crashed nodes), in which case retrying indefinitely would hang.
+const MAX_MISSING_CONFIRMATION_RETRY_ROUNDS: usize = 2;
 
 /// A set of slivers to be retrieved from Walrus.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +193,63 @@ impl<E: EncodingAxis> SliverSelector<E> {
         self.indices_and_shards
             .remove_by_left(sliver_index)
             .is_some()
+    }
+
+    /// Returns all the current slivers in the selector.
+    pub fn slivers(&self) -> Vec<SliverIndex> {
+        self.indices_and_shards.left_values().copied().collect()
+    }
+}
+
+type PendingUploadFuture<'a> =
+    Pin<Box<dyn Future<Output = ClientResult<RunOutput<Vec<BlobId>, StoreError>>> + Send + 'a>>;
+
+struct UploadOptions<'a> {
+    tail_handling: TailHandling,
+    target_nodes: Option<(Epoch, &'a [NodeIndex])>,
+    upload_intent: UploadIntent,
+    initial_completed_weight: Option<&'a HashMap<BlobId, usize>>,
+    stop_scheduling: Option<CancellationToken>,
+    cancellation: Option<CancellationToken>,
+}
+
+struct SendBlobOptions<'a> {
+    blob_persistence_type: &'a BlobPersistenceType,
+    multi_pb: Option<&'a MultiProgress>,
+    tail_handling: TailHandling,
+    quorum_forwarder: Option<tokio::sync::mpsc::Sender<UploaderEvent>>,
+    tail_handle_collector: Option<Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>>,
+    target_nodes: Option<(Epoch, &'a [NodeIndex])>,
+    initial_completed_weight: Option<&'a HashMap<BlobId, usize>>,
+}
+
+/// Pending upload state carried through a single reserve+store execution.
+#[derive(Debug, Default, Clone)]
+struct PendingUploadContext {
+    /// Nodes that reported successful pending uploads per blob.
+    /// Nodes that did not report success (errors or missing results) are treated as missing.
+    initial_success_nodes: Option<HashMap<BlobId, Vec<NodeIndex>>>,
+}
+
+struct PendingUploadHandle<'a> {
+    stop_scheduling: CancellationToken,
+    cancel: CancellationToken,
+    future: PendingUploadFuture<'a>,
+}
+
+struct ConfirmationCollection {
+    confirmations: Vec<NodeResult<SignedStorageConfirmation, NodeError>>,
+    certificate: ClientResult<ConfirmationCertificate>,
+}
+
+impl ConfirmationCollection {
+    fn into_parts(
+        self,
+    ) -> (
+        Vec<NodeResult<SignedStorageConfirmation, NodeError>>,
+        ClientResult<ConfirmationCertificate>,
+    ) {
+        (self.confirmations, self.certificate)
     }
 }
 
@@ -647,6 +716,8 @@ impl<T: ReadClient> WalrusNodeClient<T> {
         }
     }
 
+    // TODO(WAL-1136): cleanup function signaltures by bundling the parameters into a struct.
+    #[allow(clippy::too_many_arguments)]
     async fn retrieve_slivers_retry_committees<E: EncodingAxis>(
         &self,
         metadata: &VerifiedBlobMetadataWithId,
@@ -654,6 +725,7 @@ impl<T: ReadClient> WalrusNodeClient<T> {
         certified_epoch: Epoch,
         max_attempts: usize,
         timeout_duration: Duration,
+        max_unavailable_slivers_to_recover: usize,
     ) -> Result<Vec<SliverData<E>>, ClientError>
     where
         SliverData<E>: TryFrom<Sliver>,
@@ -665,6 +737,7 @@ impl<T: ReadClient> WalrusNodeClient<T> {
                 certified_epoch,
                 max_attempts,
                 timeout_duration,
+                max_unavailable_slivers_to_recover,
             )
         })
         .await
@@ -677,6 +750,8 @@ impl<T: ReadClient> WalrusNodeClient<T> {
     /// number of attempts is reached or the timeout is reached.
     ///
     /// Returned slivers may not be in the same order as the sliver_indices.
+    // TODO(WAL-1136): cleanup function signaltures by bundling the parameters into a struct.
+    #[allow(clippy::too_many_arguments)]
     async fn retrieve_slivers_with_retry<E: EncodingAxis>(
         &self,
         metadata: &VerifiedBlobMetadataWithId,
@@ -684,6 +759,7 @@ impl<T: ReadClient> WalrusNodeClient<T> {
         certified_epoch: Epoch,
         max_attempts: usize,
         timeout_duration: Duration,
+        max_unavailable_slivers_to_recover: usize,
     ) -> Result<Vec<SliverData<E>>, ClientError>
     where
         SliverData<E>: TryFrom<walrus_core::Sliver>,
@@ -757,12 +833,64 @@ impl<T: ReadClient> WalrusNodeClient<T> {
             }
         }
 
+        if sliver_selector.len() > max_unavailable_slivers_to_recover {
+            tracing::debug!(
+                "too many unavailable slivers to recover ({}/{}); unavailable slivers: {:?}; \
+                skipping recovery",
+                sliver_selector.len(),
+                max_unavailable_slivers_to_recover,
+                sliver_selector.slivers(),
+            );
+            return Err(ReconstructSliverError::TooManyUnavailableSliversToRecover(
+                sliver_selector.len(),
+                max_unavailable_slivers_to_recover,
+                format!("{:?}", sliver_selector.slivers()),
+            )
+            .into());
+        }
+
+        while !sliver_selector.is_empty() {
+            // Try to recover the unavailable slivers.
+            let slivers_to_recover = sliver_selector.slivers();
+            let recover_timeout = timeout_duration.saturating_sub(start_time.elapsed());
+            let recover_result = tokio::time::timeout(
+                recover_timeout,
+                self.recover_slivers(metadata, &slivers_to_recover, certified_epoch),
+            )
+            .await;
+            match recover_result {
+                Ok(Ok(recovered_slivers)) => {
+                    for sliver in recovered_slivers.iter() {
+                        sliver_selector.remove_sliver(&sliver.index);
+                    }
+                    all_slivers.extend(recovered_slivers.into_iter());
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(?error, "error recovering slivers");
+                    last_error = Some(error);
+                    // Retry recovering the unavailable slivers.
+                    // TODO(WAL-1135): we should save any slivers that have been recovered so far.
+                }
+                Err(timeout_error) => {
+                    tracing::debug!(?timeout_error, "timeout recovering slivers");
+                    if last_error.is_none() {
+                        last_error = Some(ClientError::from(ClientErrorKind::Other(
+                            timeout_error.into(),
+                        )));
+                    }
+                    break;
+                }
+            }
+        }
+
         if all_slivers.len() != num_unique_slivers {
             Err(ClientError::from(ClientErrorKind::Other(
                 format!(
-                    "failed to retrieve some slivers ({}/{} successful): {:?}",
+                    "failed to retrieve some slivers ({}/{} successful), unavailable \
+                    slivers: {:?}, error: {:?}",
                     all_slivers.len(),
                     num_unique_slivers,
+                    sliver_selector.slivers(),
                     last_error
                 )
                 .into(),
@@ -822,9 +950,11 @@ impl<T: ReadClient> WalrusNodeClient<T> {
         let mut requests = WeightedFutures::new(futures);
 
         // Execute all requests with appropriate concurrency limits.
-        requests
-            .execute_until(
-                &|_| false, // We want to execute all futures.
+        // NB: This is a "best effort" retrieval: we get as many slivers as possible within the
+        // timeout. Partial results are returned to the caller, which has retry logic to fetch
+        // missing slivers.
+        let completed_reason = requests
+            .execute_time(
                 timeout_duration,
                 self.communication_limits
                     .max_concurrent_sliver_reads_for_blob_size(
@@ -834,6 +964,8 @@ impl<T: ReadClient> WalrusNodeClient<T> {
                     ),
             )
             .await;
+
+        tracing::debug!(%completed_reason, "finished executing sliver retrieval requests");
 
         progress_bar.finish_with_message("slivers received");
 
@@ -851,6 +983,234 @@ impl<T: ReadClient> WalrusNodeClient<T> {
             .collect::<Vec<_>>();
 
         Ok(slivers)
+    }
+
+    /// Recovers the specified slivers by retrieving decoding symbols from storage nodes and
+    /// reconstructing the slivers using erasure coding.
+    ///
+    /// This method fetches decoding symbols from multiple storage nodes concurrently and uses
+    /// them to recover the requested slivers. It requires enough symbols to meet the recovery
+    /// threshold for the encoding type.
+    ///
+    /// When multiple slivers are requested to be recovered, the method will batch the requests
+    /// to the storage nodes to retrieve the decoding symbols for all slivers.
+    pub async fn recover_slivers<E: EncodingAxis>(
+        &self,
+        metadata: &VerifiedBlobMetadataWithId,
+        slivers_to_recover: &[SliverIndex],
+        certified_epoch: Epoch,
+    ) -> ClientResult<Vec<SliverData<E>>> {
+        tracing::debug!("starting to recover slivers {:?}", slivers_to_recover);
+        let committees = self.get_committees().await?;
+        let comms = self
+            .communication_factory
+            .node_read_communications(&committees, certified_epoch)?;
+
+        let RequiredCount::Exact(required_symbol_count) = self
+            .encoding_config
+            .get_for_type(metadata.metadata().encoding_type())
+            .n_symbols_for_recovery::<E>();
+
+        // TODO (WAL-1132): we may need a dedicated parameter for fetching symbols. See if this is
+        // needed.
+        let semaphore = Arc::new(Semaphore::new(
+            self.communication_limits.max_concurrent_sliver_reads,
+        ));
+        let mut execution_set = JoinSet::new();
+
+        // Collect all successful responses
+        // Initialize with empty symbols for all slivers to recover. This is to make sure that for
+        // a sliver that does not have any symbols retrieved, we won't miss it in the later steps.
+        let symbols_by_sliver: Arc<Mutex<HashMap<SliverIndex, Vec<DecodingSymbol<E>>>>> =
+            Arc::new(Mutex::new(
+                slivers_to_recover
+                    .iter()
+                    .map(|&sliver_index| (sliver_index, Vec::new()))
+                    .collect(),
+            ));
+
+        let mut all_slivers_have_enough_symbols_retrieved = false;
+
+        for one_node_comm in comms.into_iter() {
+            // Wait until we have enough permits to fire another task.
+            // The weight of the future is the number of shards owned by the node.
+            let permit = semaphore
+                .clone()
+                .acquire_many_owned(one_node_comm.n_owned_shards().get().into())
+                .await
+                .map_err(|e| ClientError::from(ClientErrorKind::Other(e.into())))?;
+
+            // Clone info to be used in the tokio task. Should be cheap to make a copy of these
+            // information, since they are small.
+            let symbols_by_sliver_clone = symbols_by_sliver.clone();
+            let blob_id = *metadata.blob_id();
+            let slivers_to_recover_clone = slivers_to_recover.to_vec();
+
+            // Fire off a task to retrieve the decoding symbols for the slivers. The task will run
+            // immediately.
+            execution_set.spawn(async move {
+                let result = one_node_comm
+                    .retrieve_decoding_symbols::<E>(&blob_id, &slivers_to_recover_clone)
+                    .instrument(one_node_comm.span.clone())
+                    .await;
+                drop(permit);
+                Self::process_decoding_symbols_result::<E>(result, symbols_by_sliver_clone).await
+            });
+
+            // Stop creating more requests if all slivers have fetched enough symbols.
+            if Self::slivers_needs_more_symbols(symbols_by_sliver.clone(), required_symbol_count)
+                .await
+                .is_empty()
+            {
+                all_slivers_have_enough_symbols_retrieved = true;
+                break;
+            }
+        }
+
+        if !all_slivers_have_enough_symbols_retrieved {
+            // Continue waiting until all slivers have fetched enough symbols.
+            while let Some(result) = execution_set.join_next().await {
+                if result.is_ok()
+                    && Self::slivers_needs_more_symbols(
+                        symbols_by_sliver.clone(),
+                        required_symbol_count,
+                    )
+                    .await
+                    .is_empty()
+                {
+                    all_slivers_have_enough_symbols_retrieved = true;
+                    break;
+                }
+            }
+        }
+
+        // There are still slivers that do not have enough symbols retrieved.
+        // Return an error.
+        // TODO(WAL-1133): consider if we should return a partial result instead of an error.
+        if !all_slivers_have_enough_symbols_retrieved {
+            let sliver_indices_without_enough_symbols =
+                Self::slivers_needs_more_symbols(symbols_by_sliver.clone(), required_symbol_count)
+                    .await;
+            return Err(
+                ReconstructSliverError::NotEnoughSymbolsToDecodeSliver(format!(
+                    "{:?}",
+                    sliver_indices_without_enough_symbols
+                ))
+                .into(),
+            );
+        }
+
+        // Abort all remaining tasks.
+        execution_set.abort_all();
+
+        // Now, recover each sliver
+        let mut recovered_slivers = Vec::with_capacity(slivers_to_recover.len());
+        for &sliver_index in slivers_to_recover {
+            let decoding_symbols = symbols_by_sliver
+                .lock()
+                .await
+                .remove(&sliver_index)
+                .expect("symbols_by_sliver is created using slivers_to_recover");
+
+            // Sanity check that we have enough symbols.
+            debug_assert!(
+                decoding_symbols.len() >= required_symbol_count,
+                "should have enough symbols"
+            );
+
+            // Try to recover the sliver
+            let recovered_sliver = SliverData::<E>::try_recover_sliver_from_decoding_symbols(
+                decoding_symbols,
+                sliver_index,
+                metadata.metadata(),
+                &self.encoding_config,
+            );
+
+            // TODO(WAL-1133): consider if we should return a partial result instead of an error.
+            match recovered_sliver {
+                Ok(sliver) => recovered_slivers.push(sliver),
+                Err(error) => return Err(ReconstructSliverError::DecodeSliverError(error).into()),
+            }
+        }
+
+        Ok(recovered_slivers)
+    }
+
+    /// Processes retrieve_decoding_symbols result containing decoding symbols and merges them into
+    /// the shared symbols_by_sliver map.
+    async fn process_decoding_symbols_result<E: EncodingAxis>(
+        result: NodeResult<BTreeMap<SliverIndex, Vec<EitherDecodingSymbol>>, NodeError>,
+        symbols_by_sliver: Arc<Mutex<HashMap<SliverIndex, Vec<DecodingSymbol<E>>>>>,
+    ) -> Result<(), ClientError> {
+        match result.result {
+            Ok(node_result) => {
+                for (sliver_index, symbols) in node_result {
+                    let decoded_symbols =
+                        Self::convert_either_decoding_symbols_to_decoding_symbols::<E>(symbols)?;
+                    symbols_by_sliver
+                        .lock()
+                        .await
+                        .entry(sliver_index)
+                        .or_insert_with(Vec::new)
+                        .extend(decoded_symbols);
+                }
+                Ok(())
+            }
+            Err(error) => Err(ReconstructSliverError::FetchingSymbolsError(error).into()),
+        }
+    }
+
+    /// Checks if all slivers have enough symbols retrieved.
+    async fn slivers_needs_more_symbols<E: EncodingAxis>(
+        symbols_by_sliver: Arc<Mutex<HashMap<SliverIndex, Vec<DecodingSymbol<E>>>>>,
+        required_symbol_count: usize,
+    ) -> Vec<SliverIndex> {
+        let guard = symbols_by_sliver.lock().await;
+        guard
+            .iter()
+            .filter_map(|(sliver_index, symbols)| {
+                if symbols.len() < required_symbol_count {
+                    Some(*sliver_index)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    }
+
+    /// Converts symbols from EitherDecodingSymbol to DecodingSymbol to be used for decoding.
+    fn convert_either_decoding_symbols_to_decoding_symbols<E: EncodingAxis>(
+        symbols: Vec<EitherDecodingSymbol>,
+    ) -> Result<Vec<DecodingSymbol<E>>, ClientError> {
+        symbols
+            .into_iter()
+            .map(|symbol| match symbol {
+                ByAxis::Primary(symbol) => {
+                    if !E::IS_PRIMARY {
+                        return Err::<DecodingSymbol<E>, ClientError>(
+                            ReconstructSliverError::WrongSymbolTypeToDecodeSliver(
+                                E::sliver_type(),
+                                SliverType::Primary,
+                            )
+                            .into(),
+                        );
+                    }
+                    Ok(DecodingSymbol::<E>::new(symbol.index, symbol.data))
+                }
+                ByAxis::Secondary(symbol) => {
+                    if E::IS_PRIMARY {
+                        return Err::<DecodingSymbol<E>, ClientError>(
+                            ReconstructSliverError::WrongSymbolTypeToDecodeSliver(
+                                E::sliver_type(),
+                                SliverType::Secondary,
+                            )
+                            .into(),
+                        );
+                    }
+                    Ok(DecodingSymbol::<E>::new(symbol.index, symbol.data))
+                }
+            })
+            .collect::<Result<Vec<DecodingSymbol<E>>, ClientError>>()
     }
 
     /// Encodes the blob and sends metadata and slivers to the selected nodes.
@@ -976,6 +1336,8 @@ impl WalrusNodeClient<SuiContractClient> {
             return Ok(vec![]);
         }
 
+        let store_args = self.pending_upload_store_args(store_args);
+
         tracing::info!(
             "writing {blobs_count} blob{} to Walrus",
             if blobs_count == 1 { "" } else { "s" }
@@ -1002,15 +1364,15 @@ impl WalrusNodeClient<SuiContractClient> {
         );
         store_args.maybe_observe_checking_blob_status(status_timer_duration);
 
+        let pending_blobs = self.pending_upload_candidates(&encoded_blobs_with_status, &store_args);
+
         let store_op_timer = Instant::now();
-        // Register blobs if they are not registered, and get the store operations.
-        let registered_blobs = self
-            .resource_manager(&committees)
-            .register_walrus_store_blobs(
+        let (registered_blobs, pending_upload_result) = self
+            .register_with_pending_uploads(
                 encoded_blobs_with_status,
-                store_args.epochs_ahead,
-                store_args.persistence,
-                store_args.store_optimizations,
+                &store_args,
+                &committees,
+                &pending_blobs,
             )
             .await?;
         debug_assert_eq!(
@@ -1024,6 +1386,245 @@ impl WalrusNodeClient<SuiContractClient> {
         tracing::debug!(?registered_blobs);
         store_args.maybe_observe_store_operation(store_op_duration);
 
+        let pending_context = self.apply_pending_upload_outcome(pending_upload_result);
+
+        let (mut final_result, blobs_awaiting_upload, mut blobs_pending_certify_and_extend) =
+            Self::partition_registered_blobs(registered_blobs, blobs_count);
+        let num_to_be_certified = blobs_awaiting_upload.len();
+
+        // Check if the committee has changed while registering the blobs.
+        if are_current_previous_different(
+            committees.as_ref(),
+            self.get_committees().await?.as_ref(),
+        ) {
+            tracing::warn!("committees have changed while registering blobs");
+            return Err(ClientError::from(ClientErrorKind::CommitteeChangeNotified));
+        }
+
+        // Get blob certificates for to_be_certified blobs.
+        let mut blobs_with_certificates = Vec::with_capacity(blobs_awaiting_upload.len());
+        if !blobs_awaiting_upload.is_empty() {
+            let get_certificates_timer = Instant::now();
+            // Get the blob certificates, possibly storing slivers, while checking if the committee
+            // has changed in the meantime.
+            // This operation can be safely interrupted as it does not require a wallet.
+            blobs_with_certificates = self
+                .await_while_checking_notification(self.get_all_blob_certificates(
+                    blobs_awaiting_upload,
+                    &store_args,
+                    &pending_context,
+                ))
+                .await?;
+
+            debug_assert_eq!(blobs_with_certificates.len(), num_to_be_certified);
+            let get_certificates_duration = get_certificates_timer.elapsed();
+
+            tracing::debug!(
+                duration = ?get_certificates_duration,
+                "fetched certificates for {} blobs",
+                blobs_with_certificates.len()
+            );
+            store_args.maybe_observe_get_certificates(get_certificates_duration);
+        }
+
+        // Move completed blobs to final_result and keep only non-completed ones.
+        let (to_be_certified, completed_blobs) =
+            client_types::partition_unfinished_finished(blobs_with_certificates);
+        final_result.extend(completed_blobs);
+        blobs_pending_certify_and_extend.extend(to_be_certified);
+
+        // Certify and extend the blobs on Sui.
+        final_result.extend(
+            self.certify_and_extend_blobs(blobs_pending_certify_and_extend, &store_args)
+                .await?,
+        );
+
+        Ok(final_result)
+    }
+
+    fn pending_upload_store_args(&self, store_args: &StoreArgs) -> StoreArgs {
+        let mut store_args = store_args.clone();
+        if self.config.communication_config.pending_uploads_enabled {
+            store_args.store_optimizations.optimistic_uploads = true;
+        }
+        store_args
+    }
+
+    fn pending_upload_candidates(
+        &self,
+        encoded_blobs_with_status: &[WalrusStoreBlobMaybeFinished<BlobWithStatus>],
+        store_args: &StoreArgs,
+    ) -> Vec<(VerifiedBlobMetadataWithId, Arc<Vec<SliverPair>>)> {
+        let pending_upload_max_blob_bytes = self.pending_upload_max_blob_bytes();
+        let pending_uploads_enabled = self.config.communication_config.pending_uploads_enabled;
+
+        let pending: Vec<_> = encoded_blobs_with_status
+            .iter()
+            .filter_map(|blob| {
+                blob.pending_upload_payload(
+                    pending_uploads_enabled,
+                    store_args,
+                    pending_upload_max_blob_bytes,
+                )
+            })
+            .collect();
+
+        tracing::debug!(
+            pending_candidates = pending.len(),
+            pending_enabled = pending_uploads_enabled,
+            pending_uploads = store_args.store_optimizations.pending_uploads_enabled(),
+            max_blob_bytes = pending_upload_max_blob_bytes,
+            "computed pending upload candidates",
+        );
+
+        pending
+    }
+
+    fn start_pending_uploads<'a>(
+        &'a self,
+        pending_blobs: &'a [(VerifiedBlobMetadataWithId, Arc<Vec<SliverPair>>)],
+        store_args: &StoreArgs,
+    ) -> Option<PendingUploadHandle<'a>> {
+        if pending_blobs.is_empty() {
+            return None;
+        }
+
+        // We don't need to receive the results of the pending uploads,
+        // so we can ignore the receiver. The progress bar is only updated during the upload
+        // with immediate intent later.
+        tracing::info!(
+            pending_blobs = pending_blobs.len(),
+            "starting pending upload task"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(pending_blobs.len().max(1));
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+        let stop_scheduling = CancellationToken::new();
+        let cancel = CancellationToken::new();
+        let future = Box::pin(self.distributed_upload_without_confirmation(
+            pending_blobs,
+            tx,
+            UploadOptions {
+                tail_handling: store_args.tail_handling,
+                target_nodes: None,
+                upload_intent: UploadIntent::Pending,
+                initial_completed_weight: None,
+                stop_scheduling: Some(stop_scheduling.clone()),
+                cancellation: Some(cancel.clone()),
+            },
+        ));
+
+        Some(PendingUploadHandle {
+            stop_scheduling,
+            cancel,
+            future,
+        })
+    }
+
+    async fn register_with_pending_uploads(
+        &self,
+        encoded_blobs_with_status: Vec<WalrusStoreBlobMaybeFinished<BlobWithStatus>>,
+        store_args: &StoreArgs,
+        committees: &ActiveCommittees,
+        pending_blobs: &[(VerifiedBlobMetadataWithId, Arc<Vec<SliverPair>>)],
+    ) -> ClientResult<(
+        Vec<WalrusStoreBlobMaybeFinished<RegisteredBlob>>,
+        Option<RunOutput<Vec<BlobId>, StoreError>>,
+    )> {
+        let mut pending_upload_handle = self.start_pending_uploads(pending_blobs, store_args);
+
+        // Register blobs if they are not registered, and get the store operations.
+        let resource_manager = self.resource_manager(committees);
+        let registration_fut = resource_manager.register_walrus_store_blobs(
+            encoded_blobs_with_status,
+            store_args.epochs_ahead,
+            store_args.persistence,
+            store_args.store_optimizations,
+        );
+
+        if let Some(ref mut pending) = pending_upload_handle {
+            tokio::pin!(registration_fut);
+            let mut pending_upload_result = None;
+            let pending_grace = self.config.communication_config.pending_upload_grace;
+            let registered_blobs = tokio::select! {
+                reg = &mut registration_fut => {
+                    // Stop scheduling new pending uploads once registration completes.
+                    pending.stop_scheduling.cancel();
+                    reg
+                }
+                pending_res = pending.future.as_mut() => {
+                    // Pending uploads may finish first; record their output before awaiting
+                    // registration.
+                    pending_upload_result = Some(pending_res?);
+                    registration_fut.await
+                }
+            }?;
+
+            if pending_upload_result.is_none() {
+                // Registration finished first; allow in-flight pending uploads to finish for the
+                // grace period before hard-cancelling.
+                pending.stop_scheduling.cancel();
+                if pending_grace.is_zero() {
+                    pending.cancel.cancel();
+                    match pending.future.as_mut().await {
+                        Ok(res) => pending_upload_result = Some(res),
+                        Err(err) => {
+                            tracing::debug!(?err, "pending upload task failed or cancelled")
+                        }
+                    }
+                } else {
+                    match tokio::time::timeout(pending_grace, pending.future.as_mut()).await {
+                        Ok(res) => pending_upload_result = Some(res?),
+                        Err(_) => {
+                            pending.cancel.cancel();
+                            match pending.future.as_mut().await {
+                                Ok(res) => pending_upload_result = Some(res),
+                                Err(err) => {
+                                    tracing::debug!(?err, "pending upload failed or cancelled",)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok((registered_blobs, pending_upload_result))
+        } else {
+            Ok((registration_fut.await?, None))
+        }
+    }
+
+    fn apply_pending_upload_outcome(
+        &self,
+        mut pending_upload_result: Option<RunOutput<Vec<BlobId>, StoreError>>,
+    ) -> PendingUploadContext {
+        let mut context = PendingUploadContext::default();
+        // Cancel any in-flight pending tail. Tail handle is returned during the upload with
+        // immediate intent later.
+        if let Some(ref mut pending_output) = pending_upload_result
+            && let Some(handle) = pending_output.tail_handle.take()
+        {
+            handle.abort();
+        }
+
+        if let Some(pending_output) = pending_upload_result {
+            let success_nodes = Self::successful_nodes_by_blob(&pending_output.results);
+            if !success_nodes.is_empty() {
+                context.initial_success_nodes = Some(success_nodes);
+            }
+        }
+
+        context
+    }
+
+    fn partition_registered_blobs(
+        registered_blobs: Vec<WalrusStoreBlobMaybeFinished<RegisteredBlob>>,
+        blobs_count: usize,
+    ) -> (
+        Vec<WalrusStoreBlobFinished>,
+        Vec<WalrusStoreBlobUnfinished<BlobAwaitingUpload>>,
+        Vec<WalrusStoreBlobUnfinished<BlobPendingCertifyAndExtend>>,
+    ) {
         // Classify the blobs into to_be_certified and to_be_extended, and move completed blobs to
         // final_result.
         let mut final_result: Vec<WalrusStoreBlobFinished> = Vec::with_capacity(blobs_count);
@@ -1051,52 +1652,11 @@ impl WalrusNodeClient<SuiContractClient> {
             number of blobs"
         );
 
-        // Check if the committee has changed while registering the blobs.
-        if are_current_previous_different(
-            committees.as_ref(),
-            self.get_committees().await?.as_ref(),
-        ) {
-            tracing::warn!("committees have changed while registering blobs");
-            return Err(ClientError::from(ClientErrorKind::CommitteeChangeNotified));
-        }
-
-        // Get blob certificates for to_be_certified blobs.
-        let mut blobs_with_certificates = Vec::with_capacity(blobs_awaiting_upload.len());
-        if !blobs_awaiting_upload.is_empty() {
-            let get_certificates_timer = Instant::now();
-            // Get the blob certificates, possibly storing slivers, while checking if the committee
-            // has changed in the meantime.
-            // This operation can be safely interrupted as it does not require a wallet.
-            blobs_with_certificates = self
-                .await_while_checking_notification(
-                    self.get_all_blob_certificates(blobs_awaiting_upload, store_args),
-                )
-                .await?;
-
-            debug_assert_eq!(blobs_with_certificates.len(), num_to_be_certified);
-            let get_certificates_duration = get_certificates_timer.elapsed();
-
-            tracing::debug!(
-                duration = ?get_certificates_duration,
-                "fetched certificates for {} blobs",
-                blobs_with_certificates.len()
-            );
-            store_args.maybe_observe_get_certificates(get_certificates_duration);
-        }
-
-        // Move completed blobs to final_result and keep only non-completed ones.
-        let (to_be_certified, completed_blobs) =
-            client_types::partition_unfinished_finished(blobs_with_certificates);
-        final_result.extend(completed_blobs);
-        blobs_pending_certify_and_extend.extend(to_be_certified);
-
-        // Certify and extend the blobs on Sui.
-        final_result.extend(
-            self.certify_and_extend_blobs(blobs_pending_certify_and_extend, store_args)
-                .await?,
-        );
-
-        Ok(final_result)
+        (
+            final_result,
+            blobs_awaiting_upload,
+            blobs_pending_certify_and_extend,
+        )
     }
 
     /// Fetches the status of each blob.
@@ -1129,6 +1689,7 @@ impl WalrusNodeClient<SuiContractClient> {
         &self,
         blobs_to_be_certified: Vec<WalrusStoreBlobUnfinished<BlobAwaitingUpload>>,
         store_args: &StoreArgs,
+        pending_context: &PendingUploadContext,
     ) -> ClientResult<Vec<WalrusStoreBlobMaybeFinished<BlobPendingCertifyAndExtend>>> {
         if blobs_to_be_certified.is_empty() {
             return Ok(vec![]);
@@ -1141,8 +1702,13 @@ impl WalrusNodeClient<SuiContractClient> {
             |blob_to_be_certified| {
                 let multi_pb = Arc::clone(&multi_pb);
                 async move {
-                    self.get_certificate(blob_to_be_certified, multi_pb.as_ref(), store_args)
-                        .await
+                    self.get_certificate(
+                        blob_to_be_certified,
+                        multi_pb.as_ref(),
+                        store_args,
+                        pending_context,
+                    )
+                    .await
                 }
             },
         ))
@@ -1165,6 +1731,7 @@ impl WalrusNodeClient<SuiContractClient> {
         blob_to_be_certified: WalrusStoreBlobUnfinished<BlobAwaitingUpload>,
         multi_pb: &MultiProgress,
         store_args: &StoreArgs,
+        pending_context: &PendingUploadContext,
     ) -> ClientResult<WalrusStoreBlobMaybeFinished<BlobPendingCertifyAndExtend>> {
         let committees = self.get_committees().await?;
 
@@ -1205,14 +1772,13 @@ impl WalrusNodeClient<SuiContractClient> {
                 let certify_start_timer = Instant::now();
                 let result: Result<_, ClientError> = match &encoded_blob.data {
                     BlobData::SliverPairs(sliver_pairs) => {
-                        self.send_blob_data_and_get_certificate(
+                        self.upload_and_collect_certificate(
                             &encoded_blob.metadata,
                             sliver_pairs.clone(),
                             &blob_object.blob_persistence_type(),
                             Some(multi_pb),
-                            store_args.tail_handling,
-                            store_args.quorum_event_tx.clone(),
-                            store_args.tail_handle_collector.clone(),
+                            store_args,
+                            pending_context,
                         )
                         .await
                     }
@@ -1438,6 +2004,33 @@ impl<T> WalrusNodeClient<T> {
         }
     }
 
+    fn pending_upload_max_blob_bytes(&self) -> u64 {
+        self.config
+            .communication_config
+            .optimistic_upload_max_blob_bytes
+    }
+
+    async fn process_tail_handle(
+        &self,
+        tail_handle: Option<JoinHandle<()>>,
+        tail_handling: TailHandling,
+        tail_handle_collector: Option<&Arc<tokio::sync::Mutex<Vec<JoinHandle<()>>>>>,
+    ) {
+        if let Some(handle) = tail_handle {
+            if let Some(collector) = tail_handle_collector {
+                collector.lock().await.push(handle);
+            } else if matches!(tail_handling, TailHandling::Detached) {
+                tokio::spawn(async move {
+                    if let Err(err) = handle.await {
+                        tracing::warn!(?err, "tail upload task failed");
+                    }
+                });
+            } else if let Err(err) = handle.await {
+                tracing::warn!(?err, "tail upload task failed");
+            }
+        }
+    }
+
     /// Stores the already-encoded metadata and sliver pairs for a blob into Walrus, by sending
     /// sliver pairs to at least 2f+1 shards.
     ///
@@ -1453,7 +2046,45 @@ impl<T> WalrusNodeClient<T> {
         tail_handling: TailHandling,
         quorum_forwarder: Option<tokio::sync::mpsc::Sender<UploaderEvent>>,
         tail_handle_collector: Option<Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>>,
+        target_nodes: Option<(Epoch, &[NodeIndex])>,
+        initial_completed_weight: Option<&HashMap<BlobId, usize>>,
     ) -> ClientResult<ConfirmationCertificate> {
+        let send_options = SendBlobOptions {
+            blob_persistence_type,
+            multi_pb,
+            tail_handling,
+            quorum_forwarder,
+            tail_handle_collector,
+            target_nodes,
+            initial_completed_weight,
+        };
+
+        let (_, certificate) = self
+            .send_blob_data_and_collect_confirmations(metadata, pairs, send_options)
+            .await?
+            .into_parts();
+
+        certificate
+    }
+
+    /// Uploads slivers (optionally to a target node subset) and then collects confirmations from
+    /// the full write committee; missing confirmations from non-targeted nodes still count as
+    /// missing and can trigger retries.
+    async fn send_blob_data_and_collect_confirmations(
+        &self,
+        metadata: &VerifiedBlobMetadataWithId,
+        pairs: Arc<Vec<SliverPair>>,
+        options: SendBlobOptions<'_>,
+    ) -> ClientResult<ConfirmationCollection> {
+        let SendBlobOptions {
+            blob_persistence_type,
+            multi_pb,
+            tail_handling,
+            quorum_forwarder,
+            tail_handle_collector,
+            target_nodes,
+            initial_completed_weight,
+        } = options;
         tracing::info!(blob_id = %metadata.blob_id(), "starting to send data to storage nodes");
         let committees = self.get_committees().await?;
 
@@ -1469,8 +2100,14 @@ impl<T> WalrusNodeClient<T> {
         let mut upload_fut = Box::pin(self.distributed_upload_without_confirmation(
             &blobs,
             event_tx.clone(),
-            tail_handling,
-            None,
+            UploadOptions {
+                tail_handling,
+                target_nodes,
+                upload_intent: UploadIntent::Immediate,
+                initial_completed_weight,
+                stop_scheduling: None,
+                cancellation: None,
+            },
         ));
 
         let mut upload_results: Option<RunOutput<Vec<BlobId>, StoreError>> = None;
@@ -1564,10 +2201,11 @@ impl<T> WalrusNodeClient<T> {
             }
         }
 
-        self.get_certificate_standalone(
+        self.collect_confirmation_attempt(
             metadata.blob_id(),
             committees.write_committee().epoch,
             blob_persistence_type,
+            &committees,
         )
         .await
     }
@@ -1576,59 +2214,33 @@ impl<T> WalrusNodeClient<T> {
     ///
     /// Returns the node-level results of the upload action and emits progress via the provided
     /// `event_sender`.
-    pub async fn distributed_upload_without_confirmation(
+    async fn distributed_upload_without_confirmation(
         &self,
         blobs: &[(VerifiedBlobMetadataWithId, Arc<Vec<SliverPair>>)],
         event_sender: tokio::sync::mpsc::Sender<UploaderEvent>,
-        tail_handling: TailHandling,
-        cancellation: Option<CancellationToken>,
+        options: UploadOptions<'_>,
     ) -> ClientResult<RunOutput<Vec<BlobId>, StoreError>> {
-        self.distributed_upload_without_confirmation_inner(
-            blobs,
-            event_sender,
+        let UploadOptions {
             tail_handling,
+            target_nodes,
+            upload_intent,
+            initial_completed_weight,
+            stop_scheduling,
             cancellation,
-            None,
-        )
-        .await
-    }
-
-    /// Targets only the provided node indices.
-    /// This is useful when retrying uploads without hitting already-successful nodes.
-    #[allow(dead_code)]
-    pub(crate) async fn distributed_upload_without_confirmation_for_nodes(
-        &self,
-        blobs: &[(VerifiedBlobMetadataWithId, Arc<Vec<SliverPair>>)],
-        event_sender: tokio::sync::mpsc::Sender<UploaderEvent>,
-        tail_handling: TailHandling,
-        cancellation: Option<CancellationToken>,
-        committee_epoch: Epoch,
-        node_indices: &[NodeIndex],
-    ) -> ClientResult<RunOutput<Vec<BlobId>, StoreError>> {
-        self.distributed_upload_without_confirmation_inner(
-            blobs,
-            event_sender,
-            tail_handling,
-            cancellation,
-            Some((committee_epoch, node_indices)),
-        )
-        .await
-    }
-
-    async fn distributed_upload_without_confirmation_inner(
-        &self,
-        blobs: &[(VerifiedBlobMetadataWithId, Arc<Vec<SliverPair>>)],
-        event_sender: tokio::sync::mpsc::Sender<UploaderEvent>,
-        tail_handling: TailHandling,
-        cancellation: Option<CancellationToken>,
-        target_nodes: Option<(Epoch, &[NodeIndex])>,
-    ) -> ClientResult<RunOutput<Vec<BlobId>, StoreError>> {
+        } = options;
         if blobs.is_empty() {
             return Ok(RunOutput {
                 results: Vec::new(),
                 tail_handle: None,
             });
         }
+        tracing::info!(
+            blobs = blobs.len(),
+            intent = ?upload_intent,
+            target_nodes = target_nodes.as_ref().map(|(_, nodes)| nodes.len()).unwrap_or(0),
+            cancellation = cancellation.is_some(),
+            "starting distributed upload"
+        );
 
         let committees = self.get_committees().await?;
         if let Some((target_epoch, _)) = target_nodes
@@ -1673,25 +2285,51 @@ impl<T> WalrusNodeClient<T> {
             .sliver_write_extra_time
             .clone();
 
-        let mut uploader =
-            DistributedUploader::new(blobs, committees.clone(), comms, sliver_write_extra_time);
+        let mut uploader = DistributedUploader::new(
+            blobs,
+            committees.clone(),
+            comms,
+            sliver_write_extra_time,
+            initial_completed_weight,
+        );
 
         let run_output = uploader
             .run_distributed_upload(
-                |node, work| async move {
+                move |node, work| async move {
+                    tracing::debug!(
+                        node = ?node.node_index,
+                        work_items = work.len(),
+                        intent = ?upload_intent,
+                        "upload worker starting"
+                    );
                     let mut stored = Vec::with_capacity(work.len());
                     for item in &work {
                         let response = node
                             .store_metadata_and_pairs_without_confirmation(
                                 &item.metadata,
                                 item.pair_indices.iter().map(|&i| &item.pairs[i]),
-                                UploadIntent::Immediate,
+                                upload_intent,
                             )
                             .await;
 
                         match response.result {
-                            Ok(()) => stored.push(*item.blob_id()),
+                            Ok(()) => {
+                                tracing::debug!(
+                                    node = ?node.node_index,
+                                    blob_id = %item.blob_id(),
+                                    intent = ?upload_intent,
+                                    "store without confirmation succeeded"
+                                );
+                                stored.push(*item.blob_id())
+                            }
                             Err(err) => {
+                                tracing::warn!(
+                                    node = ?node.node_index,
+                                    blob_id = %item.blob_id(),
+                                    intent = ?upload_intent,
+                                    ?err,
+                                    "store without confirmation failed"
+                                );
                                 return NodeResult::new(
                                     response.committee_epoch,
                                     response.weight,
@@ -1711,11 +2349,218 @@ impl<T> WalrusNodeClient<T> {
                 },
                 event_sender,
                 tail_handling,
+                stop_scheduling,
                 cancellation,
             )
             .await?;
 
         Ok(run_output)
+    }
+
+    /// Immediate upload path that seeds the uploader with any initial weight and retries missing
+    /// confirmations with immediate intent.
+    async fn upload_and_collect_certificate(
+        &self,
+        metadata: &VerifiedBlobMetadataWithId,
+        pairs: Arc<Vec<SliverPair>>,
+        blob_persistence_type: &BlobPersistenceType,
+        multi_pb: Option<&MultiProgress>,
+        store_args: &StoreArgs,
+        pending_context: &PendingUploadContext,
+    ) -> ClientResult<ConfirmationCertificate> {
+        let blobs = vec![(metadata.clone(), pairs.clone())];
+        let committees = self.get_committees().await?;
+        let mut missing_nodes = None;
+        let mut initial_completed_weight = None;
+        if let Some(success_nodes) = pending_context
+            .initial_success_nodes
+            .as_ref()
+            .and_then(|m| m.get(metadata.blob_id()))
+        {
+            // Nodes that did not report success are treated as missing.
+            let success_set: HashSet<NodeIndex> = success_nodes.iter().copied().collect();
+            let all_nodes = committees.write_committee().members().len();
+            let missing: Vec<NodeIndex> = (0..all_nodes)
+                .filter(|idx| !success_set.contains(idx))
+                .collect();
+            if !missing.is_empty() {
+                missing_nodes = Some(missing);
+            }
+
+            let members = committees.write_committee().members();
+            let weight: usize = success_nodes
+                .iter()
+                .map(|idx| members[*idx].shard_ids.len())
+                .sum();
+            if weight > 0 {
+                initial_completed_weight = Some(HashMap::from([(*metadata.blob_id(), weight)]));
+            }
+        }
+        let target_nodes = missing_nodes
+            .as_ref()
+            .map(|nodes| (committees.epoch(), nodes.as_slice()));
+
+        let send_options = SendBlobOptions {
+            blob_persistence_type,
+            multi_pb,
+            tail_handling: store_args.tail_handling,
+            quorum_forwarder: store_args.quorum_event_tx.clone(),
+            tail_handle_collector: store_args.tail_handle_collector.clone(),
+            target_nodes,
+            initial_completed_weight: initial_completed_weight.as_ref(),
+        };
+
+        let (confirmation_results, upload_result) = self
+            .send_blob_data_and_collect_confirmations(metadata, pairs, send_options)
+            .await?
+            .into_parts();
+
+        match upload_result {
+            Ok(cert) => Ok(cert),
+            Err(err) => {
+                if !matches!(err.kind(), ClientErrorKind::NotEnoughConfirmations(_, _)) {
+                    return Err(err);
+                }
+
+                let certified_epoch = committees.write_committee().epoch;
+
+                // Pending slivers can be cache-evicted, so retry uploads to nodes that never
+                // confirmed.
+                self.retry_missing_nodes(
+                    metadata,
+                    blob_persistence_type,
+                    certified_epoch,
+                    &committees,
+                    &blobs,
+                    store_args,
+                    confirmation_results,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Retries the upload with immediate intent to the missing nodes until quorum is reached.
+    #[allow(clippy::too_many_arguments)]
+    async fn retry_missing_nodes(
+        &self,
+        metadata: &VerifiedBlobMetadataWithId,
+        blob_persistence_type: &BlobPersistenceType,
+        certified_epoch: Epoch,
+        committees: &ActiveCommittees,
+        blobs: &[(VerifiedBlobMetadataWithId, Arc<Vec<SliverPair>>)],
+        store_args: &StoreArgs,
+        confirmation_results: Vec<NodeResult<SignedStorageConfirmation, NodeError>>,
+    ) -> ClientResult<ConfirmationCertificate> {
+        let mut confirmation_results = confirmation_results;
+        let mut attempts = 0usize;
+
+        loop {
+            let not_enough_confirmations_err =
+                match self.confirmations_to_certificate_ref(&confirmation_results, committees) {
+                    Ok(cert) => return Ok(cert),
+                    Err(err) => {
+                        if !matches!(err.kind(), ClientErrorKind::NotEnoughConfirmations(_, _)) {
+                            return Err(err);
+                        }
+                        err
+                    }
+                };
+
+            let mut confirmed_nodes = HashSet::new();
+            let mut confirmed_weight = 0usize;
+            for NodeResult {
+                weight,
+                node,
+                result,
+                ..
+            } in &confirmation_results
+            {
+                if result.is_ok() && confirmed_nodes.insert(*node) {
+                    confirmed_weight += weight;
+                }
+            }
+
+            let all_nodes: HashSet<NodeIndex> =
+                (0..committees.write_committee().members().len()).collect();
+            let missing_nodes: Vec<NodeIndex> =
+                all_nodes.difference(&confirmed_nodes).copied().collect();
+            tracing::debug!(
+                blob_id = %metadata.blob_id(),
+                confirmed_weight,
+                confirmed_nodes = confirmed_nodes.len(),
+                missing_nodes = missing_nodes.len(),
+                "retrying missing confirmations"
+            );
+
+            if missing_nodes.is_empty() {
+                return self.confirmations_to_certificate(confirmation_results, committees);
+            }
+
+            if attempts >= MAX_MISSING_CONFIRMATION_RETRY_ROUNDS {
+                tracing::warn!(
+                    blob_id = %metadata.blob_id(),
+                    confirmed_weight,
+                    confirmed_nodes = confirmed_nodes.len(),
+                    missing_nodes = missing_nodes.len(),
+                    attempts,
+                    "missing confirmation retries exhausted; giving up"
+                );
+                return Err(not_enough_confirmations_err);
+            }
+            attempts += 1;
+
+            // Drain uploader progress events so bounded channels don't deadlock the retry path.
+            let buffer = committees
+                .write_committee()
+                .members()
+                .len()
+                .saturating_mul(blobs.len().max(1))
+                .saturating_add(1)
+                .max(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(buffer);
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+
+            let initial_weight = (confirmed_weight > 0)
+                .then(|| HashMap::from([(*metadata.blob_id(), confirmed_weight)]));
+
+            let retry_results = self
+                .distributed_upload_without_confirmation(
+                    blobs,
+                    tx,
+                    UploadOptions {
+                        tail_handling: store_args.tail_handling,
+                        target_nodes: Some((certified_epoch, &missing_nodes)),
+                        upload_intent: UploadIntent::Immediate,
+                        initial_completed_weight: initial_weight.as_ref(),
+                        stop_scheduling: None,
+                        cancellation: None,
+                    },
+                )
+                .await?;
+            tracing::debug!(
+                blob_id = %metadata.blob_id(),
+                missing_nodes = missing_nodes.len(),
+                retry_results = retry_results.results.len(),
+                "retry upload completed"
+            );
+
+            self.process_tail_handle(
+                retry_results.tail_handle,
+                store_args.tail_handling,
+                store_args.tail_handle_collector.as_ref(),
+            )
+            .await;
+
+            confirmation_results = self
+                .collect_confirmations(
+                    metadata.blob_id(),
+                    certified_epoch,
+                    blob_persistence_type,
+                    committees,
+                )
+                .await?;
+        }
     }
 
     fn node_write_communications_for_upload(
@@ -1742,17 +2587,16 @@ impl<T> WalrusNodeClient<T> {
         }
     }
 
-    /// Fetches confirmations for a blob from a quorum of nodes and returns the certificate.
-    async fn get_certificate_standalone(
+    async fn collect_confirmations(
         &self,
         blob_id: &BlobId,
         certified_epoch: Epoch,
         blob_persistence_type: &BlobPersistenceType,
-    ) -> ClientResult<ConfirmationCertificate> {
-        let committees = self.get_committees().await?;
+        committees: &ActiveCommittees,
+    ) -> ClientResult<Vec<NodeResult<SignedStorageConfirmation, NodeError>>> {
         let comms = self
             .communication_factory
-            .node_read_communications(&committees, certified_epoch)?;
+            .node_read_communications(committees, certified_epoch)?;
 
         let mut requests = WeightedFutures::new(comms.iter().map(|n| {
             n.get_confirmation_with_retries(blob_id, committees.epoch(), blob_persistence_type)
@@ -1764,9 +2608,47 @@ impl<T> WalrusNodeClient<T> {
                 self.communication_limits.max_concurrent_sliver_reads,
             )
             .await;
-        let results = requests.into_results();
 
-        self.confirmations_to_certificate(results, &committees)
+        Ok(requests.into_results())
+    }
+
+    async fn collect_confirmation_attempt(
+        &self,
+        blob_id: &BlobId,
+        certified_epoch: Epoch,
+        blob_persistence_type: &BlobPersistenceType,
+        committees: &ActiveCommittees,
+    ) -> ClientResult<ConfirmationCollection> {
+        let confirmations = self
+            .collect_confirmations(blob_id, certified_epoch, blob_persistence_type, committees)
+            .await?;
+
+        let certificate = self.confirmations_to_certificate_ref(&confirmations, committees);
+        Ok(ConfirmationCollection {
+            confirmations,
+            certificate,
+        })
+    }
+
+    /// Fetches confirmations for a blob from a quorum of nodes and returns the certificate.
+    async fn get_certificate_standalone(
+        &self,
+        blob_id: &BlobId,
+        certified_epoch: Epoch,
+        blob_persistence_type: &BlobPersistenceType,
+    ) -> ClientResult<ConfirmationCertificate> {
+        let committees = self.get_committees().await?;
+        let (_, certificate) = self
+            .collect_confirmation_attempt(
+                blob_id,
+                certified_epoch,
+                blob_persistence_type,
+                &committees,
+            )
+            .await?
+            .into_parts();
+
+        certificate
     }
 
     /// Combines the received storage confirmations into a single certificate.
@@ -1782,27 +2664,31 @@ impl<T> WalrusNodeClient<T> {
         confirmations: Vec<NodeResult<SignedStorageConfirmation, E>>,
         committees: &ActiveCommittees,
     ) -> ClientResult<ConfirmationCertificate> {
+        self.confirmations_to_certificate_ref(&confirmations, committees)
+    }
+
+    fn confirmations_to_certificate_ref<E: Display>(
+        &self,
+        confirmations: &[NodeResult<SignedStorageConfirmation, E>],
+        committees: &ActiveCommittees,
+    ) -> ClientResult<ConfirmationCertificate> {
         let mut aggregate_weight = 0;
         let mut signers = Vec::with_capacity(confirmations.len());
         let mut signed_messages = Vec::with_capacity(confirmations.len());
 
-        for NodeResult {
-            weight,
-            node,
-            result,
-            ..
-        } in confirmations
-        {
-            match result {
-                Ok(confirmation) => {
-                    aggregate_weight += weight;
-                    signed_messages.push(confirmation);
+        for confirmation in confirmations {
+            match &confirmation.result {
+                Ok(confirmation_msg) => {
+                    aggregate_weight += confirmation.weight;
+                    signed_messages.push(confirmation_msg.clone());
                     signers.push(
-                        u16::try_from(node)
+                        u16::try_from(confirmation.node)
                             .expect("the node index is computed from the vector of members"),
                     );
                 }
-                Err(error) => tracing::info!(node, %error, "storing metadata and pairs failed"),
+                Err(error) => {
+                    tracing::info!(confirmation.node, %error, "storing metadata and pairs failed")
+                }
             }
         }
 
@@ -1825,6 +2711,31 @@ impl<T> WalrusNodeClient<T> {
         committees: &ActiveCommittees,
     ) -> ClientError {
         ClientErrorKind::NotEnoughConfirmations(weight, committees.min_n_correct()).into()
+    }
+
+    /// Returns per-blob successful nodes from pending upload results.
+    /// Nodes that did not report success (errors or missing results) are treated as missing later.
+    fn successful_nodes_by_blob(
+        results: &[NodeResult<Vec<BlobId>, StoreError>],
+    ) -> HashMap<BlobId, Vec<NodeIndex>> {
+        let mut nodes_by_blob: HashMap<BlobId, HashSet<NodeIndex>> = HashMap::new();
+
+        for res in results {
+            if let Ok(blob_ids) = &res.result {
+                for blob_id in blob_ids {
+                    nodes_by_blob.entry(*blob_id).or_default().insert(res.node);
+                }
+            }
+        }
+
+        nodes_by_blob
+            .into_iter()
+            .map(|(blob_id, mut nodes)| {
+                let mut nodes = nodes.drain().collect::<Vec<_>>();
+                nodes.sort_unstable();
+                (blob_id, nodes)
+            })
+            .collect()
     }
 
     /// Requests the slivers and decodes them into a blob.

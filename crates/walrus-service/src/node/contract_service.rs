@@ -21,7 +21,6 @@ use walrus_core::{Epoch, PublicKey, messages::InvalidBlobCertificate};
 use walrus_sui::{
     client::{
         BlobObjectMetadata,
-        CoinType,
         FixedSystemParameters,
         ReadClient,
         SuiClientError,
@@ -29,6 +28,7 @@ use walrus_sui::{
         SuiContractClient,
         SuiReadClient,
     },
+    coin::CoinType,
     types::{
         StorageNodeCap,
         UpdatePublicKeyParams,
@@ -340,18 +340,14 @@ async fn monitor_sui_balance(
         let _now = interval.tick().await;
         let mut client = contract_client.lock().await;
 
-        let address = client.wallet_mut().active_address().ok();
-        let address = address
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_default();
+        let address = client.wallet_mut().active_address().to_string();
         let span = tracing::info_span!("check_sui_balance", sui.address = %address);
 
         async {
             tracing::trace!("querying wallet SUI balance");
 
-            let balance_mist = match client.balance(CoinType::Sui).await {
-                Ok(balance_mist) => balance_mist,
+            let balance_mist = match client.total_balance(CoinType::Sui).await {
+                Ok(balance) => balance,
                 Err(error) => {
                     tracing::warn!(?error, "failed to get SUI balance, skipping interval");
                     return; // Exit the async closure, does not exit the outer function.

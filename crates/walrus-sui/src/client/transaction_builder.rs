@@ -13,12 +13,12 @@ use std::{
 
 use fastcrypto::traits::ToFromBytes;
 use sui_move_build::CompiledPackage;
-use sui_sdk::rpc_types::SuiObjectDataOptions;
 use sui_types::{
     Identifier,
     SUI_CLOCK_OBJECT_ID,
     SUI_CLOCK_OBJECT_SHARED_VERSION,
-    base_types::{ObjectID, ObjectType, SuiAddress},
+    TypeTag,
+    base_types::{ObjectID, ObjectRef, SuiAddress},
     programmable_transaction_builder::ProgrammableTransactionBuilder,
     transaction::{
         Argument,
@@ -52,6 +52,7 @@ use super::{
 };
 use crate::{
     client::retry_client::retriable_sui_client::GasBudgetAndPrice,
+    coin::Coin,
     contracts::{self, FunctionTag},
     types::{
         NetworkAddress,
@@ -163,32 +164,51 @@ impl WalrusPtbBuilder {
         }
     }
 
+    /// Calls `fill_wal_balance_with_provided_coins` with no provided coins.
+    pub fn fill_wal_balance(
+        &mut self,
+        min_balance: u64,
+    ) -> impl Future<Output = SuiClientResult<()>> {
+        self.fill_wal_balance_with_provided_coins(min_balance, None)
+    }
+
     /// Fills up the WAL coin argument of the PTB to at least `min_balance`.
     ///
     /// This function merges additional coins if necessary and is a no-op if the current available
     /// balance (that has already been added to the PTB and hasn't been consumed yet) is larger than
     /// `min_balance`.
     ///
+    /// When passed a list of `coins`, those coins are used to fill the balance. Otherwise, coins
+    /// are fetched from the network.
+    ///
     /// # Errors
     ///
     /// Returns a [`SuiClientError::NoCompatibleWalCoins`] if no WAL coins with sufficient balance
     /// can be found.
-    pub async fn fill_wal_balance(&mut self, min_balance: u64) -> SuiClientResult<()> {
+    pub async fn fill_wal_balance_with_provided_coins(
+        &mut self,
+        min_balance: u64,
+        coins: Option<Vec<Coin>>,
+    ) -> SuiClientResult<()> {
         // If we already have a wal_coin_arg and sufficient balance, we're done
         if min_balance <= self.tx_wal_balance && self.wal_coin_arg.is_some() {
             return Ok(());
         }
 
         let additional_balance = min_balance - self.tx_wal_balance;
-        let mut coins = self
-            .read_client
-            .get_coins_with_total_balance(
-                self.sender_address,
-                CoinType::Wal,
-                additional_balance,
-                self.used_wal_coins.iter().cloned().collect(),
-            )
-            .await?;
+        let mut coins = if let Some(coins) = coins {
+            coins
+        } else {
+            self.read_client
+                .get_coins_with_total_balance(
+                    self.sender_address,
+                    CoinType::Wal,
+                    additional_balance,
+                    self.used_wal_coins.iter().cloned().collect(),
+                )
+                .await?
+        };
+
         let mut added_balance = 0;
         let main_coin = if let Some(coin_arg) = self.wal_coin_arg {
             coin_arg
@@ -204,15 +224,16 @@ impl WalrusPtbBuilder {
             coin_arg
         };
         if !coins.is_empty() {
-            let coin_args = coins
-                .into_iter()
-                .map(|coin| {
-                    // Make sure that we don't select the same coin later again.
-                    self.used_wal_coins.insert(coin.coin_object_id);
-                    added_balance += coin.balance;
-                    self.pt_builder.input(coin.object_ref().into())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut coin_args = Vec::new();
+            for coin in coins {
+                if self.tx_wal_balance + added_balance >= min_balance {
+                    break;
+                }
+                // Make sure that we don't select the same coin later again.
+                self.used_wal_coins.insert(coin.coin_object_id);
+                added_balance += coin.balance;
+                coin_args.push(self.pt_builder.input(coin.object_ref().into())?);
+            }
             self.pt_builder
                 .command(Command::MergeCoins(main_coin, coin_args));
         }
@@ -1130,24 +1151,18 @@ impl WalrusPtbBuilder {
     /// argument (instead of allowing an `ArgumentOrOwnedObject`).
     pub async fn authenticate_with_object(
         &mut self,
-        object: ObjectID,
+        object_id: ObjectID,
     ) -> SuiClientResult<Argument> {
-        let object_data = self
+        let (object_ref, type_tag): (ObjectRef, TypeTag) = self
             .read_client
             .retriable_sui_client()
-            .get_object_with_options(object, SuiObjectDataOptions::new().with_type())
-            .await?
-            .data
-            .ok_or_else(|| anyhow::anyhow!("no object data returned"))?;
-        let ObjectType::Struct(object_type) = object_data.object_type()? else {
-            return Err(anyhow::anyhow!("object is not a struct").into());
-        };
-        let object_ref = object_data.object_ref();
+            .get_object_ref_and_type_tag(object_id)
+            .await?;
         let object_arg = self
             .pt_builder
             .obj(ObjectArg::ImmOrOwnedObject(object_ref))?;
         let result_arg = self.walrus_move_call(
-            contracts::auth::authenticate_with_object.with_type_params(&[object_type.into()]),
+            contracts::auth::authenticate_with_object.with_type_params(&[type_tag]),
             vec![object_arg],
         )?;
         Ok(result_arg)
@@ -1412,6 +1427,17 @@ impl WalrusPtbBuilder {
         Ok(())
     }
 
+    /// Recalculates and updates the system storage and write prices based on the current
+    /// committee's price votes.
+    pub fn apply_system_prices(&mut self) -> SuiClientResult<()> {
+        let args = vec![
+            self.staking_arg(SharedObjectMutability::Mutable)?,
+            self.system_arg(SharedObjectMutability::Mutable)?,
+        ];
+        self.walrus_move_call(contracts::staking::update_prices, args)?;
+        Ok(())
+    }
+
     /// Votes for an upgrade of the system contract from the Node with `node_id`.
     pub async fn vote_for_upgrade(
         &mut self,
@@ -1582,7 +1608,7 @@ impl WalrusPtbBuilder {
         self,
         gas_budget: Option<u64>,
     ) -> SuiClientResult<TransactionData> {
-        self.transfer_outputs_and_build_transaction_data(gas_budget, 0)
+        self.transfer_outputs_and_build_transaction_data(gas_budget, 0, None)
             .await
     }
 
@@ -1594,6 +1620,7 @@ impl WalrusPtbBuilder {
         mut self,
         gas_budget: Option<u64>,
         minimum_gas_coin_balance: u64,
+        gas_coins: Option<Vec<Coin>>,
     ) -> SuiClientResult<TransactionData> {
         self.transfer_remaining_outputs(None).await?;
         let programmable_transaction = self.pt_builder.finish();
@@ -1605,6 +1632,7 @@ impl WalrusPtbBuilder {
             gas_budget,
             minimum_gas_coin_balance,
             self.tx_sui_cost,
+            gas_coins,
         )
         .await
     }
@@ -1631,17 +1659,13 @@ impl WalrusPtbBuilder {
                 self.authenticate_sender()
             }
             Authorized::Object(receiver) => {
-                let object = self
+                let owner_address = self
                     .read_client
                     .retriable_sui_client()
-                    .get_object_with_options(receiver, SuiObjectDataOptions::default().with_owner())
+                    .get_object_owner_address(receiver)
                     .await?;
                 ensure!(
-                    object
-                        .owner()
-                        .ok_or_else(|| anyhow::anyhow!("no object owner returned from rpc"))?
-                        .get_owner_address()?
-                        == self.sender_address,
+                    owner_address == self.sender_address,
                     SuiClientError::NotAuthorizedForPool(node_id)
                 );
                 self.authenticate_with_object(receiver).await
@@ -1794,6 +1818,7 @@ pub async fn build_transaction_data_with_min_gas_balance(
     gas_budget: Option<u64>,
     minimum_gas_coin_balance: u64,
     tx_sui_cost: u64,
+    gas_coins: Option<Vec<Coin>>,
 ) -> SuiClientResult<TransactionData> {
     // Estimate the gas budget unless explicitly set.
     let GasBudgetAndPrice {
@@ -1810,12 +1835,27 @@ pub async fn build_transaction_data_with_min_gas_balance(
 
     let minimum_gas_coin_balance = minimum_gas_coin_balance.max(gas_budget + tx_sui_cost);
 
+    let gas_payment = {
+        if let Some(gas_coins) = gas_coins {
+            gas_coins
+                .into_iter()
+                .scan(0, |total, coin| {
+                    let was_under = *total < minimum_gas_coin_balance;
+                    *total += coin.balance;
+                    was_under.then_some(coin.object_ref())
+                })
+                .collect()
+        } else {
+            read_client
+                .get_compatible_gas_coins(sender_address, minimum_gas_coin_balance)
+                .await?
+        }
+    };
+
     // Construct the transaction with gas coins that meet the minimum balance requirement
     Ok(TransactionData::new_programmable(
         sender_address,
-        read_client
-            .get_compatible_gas_coins(sender_address, minimum_gas_coin_balance)
-            .await?,
+        gas_payment,
         programmable_transaction,
         gas_budget,
         gas_price,

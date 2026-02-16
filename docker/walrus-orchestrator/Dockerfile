@@ -3,7 +3,7 @@
 # Copy in all crates, Cargo.toml and Cargo.lock unmodified,
 # and build the application.
 
-FROM rust:1.92-bookworm AS builder
+FROM rust:1.93-bookworm AS builder
 
 ARG PROFILE=release
 ARG GIT_REVISION
@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y cmake clang
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
-
+COPY setup setup
 RUN cargo build --profile $PROFILE --bin walrus-orchestrator
 
 # Production Image for walrus orchestrator

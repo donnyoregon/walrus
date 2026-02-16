@@ -316,7 +316,6 @@ mod commands {
             transaction_builder::WalrusPtbBuilder,
         },
         config::load_wallet_context_from_path,
-        system_setup::compile_package,
     };
     use walrus_utils::{backoff::ExponentialBackoffConfig, load_from_yaml};
 
@@ -511,7 +510,7 @@ mod commands {
             load_wallet_context_from_path(admin_wallet_path, sui_client_request_timeout)
                 .context("unable to load admin wallet")?;
 
-        let rpc_urls = &[admin_wallet.get_rpc_url()?];
+        let rpc_urls = &[admin_wallet.get_rpc_url().to_string()];
 
         let mut admin_contract_client = testbed_config
             .system_ctx
@@ -619,24 +618,20 @@ mod commands {
     ) -> anyhow::Result<()> {
         utils::init_tracing_subscriber()?;
 
-        let wallet =
-            load_wallet_context_from_path(wallet_path, None).context("unable to load wallet")?;
+        let wallet = load_wallet_context_from_path(wallet_path.clone(), None)
+            .context("unable to load wallet")?;
         let contract_config = ContractConfig::new(system_object_id, staking_object_id);
 
-        let rpc_urls = &[wallet.get_rpc_url()?];
+        let rpc_urls = &[wallet.get_rpc_url().to_string()];
 
         let contract_client =
             SuiContractClient::new(wallet, rpc_urls, &contract_config, Default::default(), None)
                 .await?;
         if serialize_unsigned {
             // Compile package
-            let chain_id = contract_client
-                .retriable_sui_client()
-                .get_chain_identifier()
-                .await
-                .ok();
-            let (compiled_package, _build_config) =
-                compile_package(contract_dir, Default::default(), chain_id).await?;
+            let (compiled_package, _build_config, _root_package) = contract_client
+                .compile_package(contract_dir, Default::default())
+                .await?;
 
             let sender = sender.unwrap_or(contract_client.address());
             let mut pt_builder = WalrusPtbBuilder::new(contract_client.read_client, sender);
@@ -686,7 +681,7 @@ mod commands {
             load_wallet_context_from_path(wallet_path, None).context("unable to load wallet")?;
         let contract_config = ContractConfig::new(system_object_id, staking_object_id);
 
-        let rpc_urls = &[wallet.get_rpc_url()?];
+        let rpc_urls = &[wallet.get_rpc_url().to_string()];
 
         let contract_client =
             SuiContractClient::new(wallet, rpc_urls, &contract_config, Default::default(), None)

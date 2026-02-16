@@ -12,9 +12,8 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Result, anyhow};
-use move_core_types::language_storage::StructTag as MoveStructTag;
-use move_package::{BuildConfig as MoveBuildConfig, source_package::layout::SourcePackageLayout};
+use anyhow::{Context as _, Result, anyhow};
+use move_core_types::language_storage::StructTag;
 use serde::{Deserialize, Serialize};
 use sui_config::{Config, SUI_KEYSTORE_FILENAME, sui_config_dir};
 use sui_keys::keystore::{
@@ -39,14 +38,20 @@ use walrus_core::{
     Epoch,
     EpochCount,
     encoding::encoded_blob_length_for_n_shards,
+    ensure,
     keys::ProtocolKeyPair,
     messages::{ProofOfPossessionMsg, SignedMessage},
 };
 
 use crate::{
-    client::{SuiClientResult, SuiContractClient, retry_client::RetriableSuiClient},
+    client::{
+        SuiClientResult,
+        SuiContractClient,
+        retry_client::{RetriableSuiClient, retriable_sui_client::MAX_GAS_PAYMENT_OBJECTS},
+    },
+    coin::Coin,
     config::load_wallet_context_from_path,
-    contracts::AssociatedContractStruct,
+    contracts::{AssociatedContractStruct, MoveConversionError},
     wallet::Wallet,
 };
 
@@ -107,13 +112,24 @@ pub(crate) fn get_package_id_from_object_response(
     Ok(move_object_type.address().into())
 }
 
+/// Gets the package address from an object.
+///
+/// Note: This returns the package address from the object type, not the newest package ID.
+pub(crate) fn get_package_id_from_object(object: &sui_types::object::Object) -> Result<ObjectID> {
+    Ok(object
+        .struct_tag()
+        .context("object does not have a struct tag")?
+        .address
+        .into())
+}
+
 /// Gets the objects of the given type that were created in a transaction.
 ///
 /// All the object ids of the objects created in the transaction, and of type represented by the
 /// `struct_tag`, are taken from the [`SuiTransactionBlockResponse`].
 pub(crate) fn get_created_sui_object_ids_by_type(
     response: &SuiTransactionBlockResponse,
-    struct_tag: &MoveStructTag,
+    struct_tag: &StructTag,
 ) -> Result<Vec<ObjectID>> {
     match response.object_changes.as_ref() {
         Some(changes) => Ok(changes
@@ -148,19 +164,50 @@ pub(crate) fn get_sui_object_from_object_response<U>(
 where
     U: AssociatedContractStruct,
 {
-    U::try_from_object_data(object_response.data.as_ref().ok_or_else(|| {
-        anyhow!(
-            "response does not contain object data [err={:?}]",
-            object_response.error
-        )
-    })?)
-    .map_err(|_e| {
-        anyhow!(
+    Ok(
+        U::try_from_object_data(object_response.data.as_ref().with_context(|| {
+            format!(
+                "response does not contain object data [err={:?}]",
+                object_response.error
+            )
+        })?)
+        .with_context(|| {
+            format!(
+                "could not convert object to expected type {}",
+                U::CONTRACT_STRUCT
+            )
+        })?,
+    )
+}
+
+pub(crate) fn get_sui_object_from_bcs<U>(
+    bcs_data: &[u8],
+    struct_tag: &StructTag,
+) -> SuiClientResult<U>
+where
+    U: AssociatedContractStruct,
+{
+    ensure!(
+        struct_tag.name.as_str() == U::CONTRACT_STRUCT.name
+            && struct_tag.module.as_str() == U::CONTRACT_STRUCT.module,
+        MoveConversionError::TypeMismatch {
+            expected: U::CONTRACT_STRUCT.to_string(),
+            actual: format!(
+                "{}::{} ({})",
+                struct_tag.module.as_str(),
+                struct_tag.name.as_str(),
+                struct_tag
+            ),
+        }
+        .into()
+    );
+
+    Ok(bcs::from_bytes::<U>(bcs_data).with_context(|| {
+        format!(
             "could not convert object to expected type {}",
             U::CONTRACT_STRUCT
         )
-        .into()
-    })
+    })?)
 }
 
 pub(crate) async fn handle_pagination<F, T, C, Fut, ErrorT>(
@@ -372,7 +419,7 @@ async fn sui_coin_set(
     address: SuiAddress,
 ) -> Result<HashSet<ObjectID>> {
     Ok(retriable_sui_client
-        .select_all_coins(address, None)
+        .select_all_coins(address, Coin::SUI)
         .await?
         .into_iter()
         .map(|coin| coin.coin_object_id)
@@ -426,17 +473,23 @@ pub async fn get_sui_from_wallet_or_faucet(
 ) -> Result<()> {
     let one_sui = 1_000_000_000;
     let min_balance = sui_amount + 2 * one_sui;
-    let sender = wallet.active_address()?;
-    let rpc_urls = &[wallet.get_rpc_url()?];
+    let sender = wallet.active_address();
+    let rpc_urls = &[wallet.get_rpc_url()];
     let client = RetriableSuiClient::new_for_rpc_urls(rpc_urls, Default::default(), None)?;
-    let balance = client.get_balance(sender, None).await?;
-    if balance.total_balance >= u128::from(min_balance) {
+    let balance = client.get_total_balance(sender, Coin::SUI).await?;
+    if balance >= min_balance {
         let mut ptb = ProgrammableTransactionBuilder::new();
         ptb.transfer_sui(address, Some(sui_amount));
         let ptb = ptb.finish();
         let gas_budget = one_sui / 2;
         let gas_coins = client
-            .select_coins(sender, None, u128::from(gas_budget + one_sui), vec![])
+            .select_coins(
+                sender,
+                Coin::SUI,
+                u128::from(gas_budget + one_sui),
+                vec![],
+                MAX_GAS_PAYMENT_OBJECTS,
+            )
             .await?
             .iter()
             .map(|coin| coin.object_ref())
@@ -483,18 +536,4 @@ pub fn generate_proof_of_possession_for_address(
         sui_address.to_inner(),
         bls_sk.public().clone(),
     ))
-}
-
-/// Resolve Move.lock file path in package directory (where Move.toml is).
-/// Taken with small modifications (no rerooting/changing current directory) from
-/// `sui_move::manage_package::resolve_lock_file_path` to avoid adding a dependency.
-pub(crate) fn resolve_lock_file_path(
-    mut build_config: MoveBuildConfig,
-    package_path: &Path,
-) -> Result<MoveBuildConfig, anyhow::Error> {
-    if build_config.lock_file.is_none() {
-        let lock_file_path = package_path.join(SourcePackageLayout::Lock.path());
-        build_config.lock_file = Some(lock_file_path);
-    }
-    Ok(build_config)
 }

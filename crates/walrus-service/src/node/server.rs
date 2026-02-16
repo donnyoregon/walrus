@@ -77,6 +77,14 @@ pub struct RestApiConfig {
 
     /// Live-upload based deferral policy.
     pub live_upload_deferral: crate::node::config::LiveUploadDeferralConfig,
+
+    /// Maximum duration to long-poll confirmation requests while waiting for registration.
+    pub confirmation_long_poll_max: Duration,
+
+    /// Maximum number of in-flight confirmation long-poll requests.
+    ///
+    /// If the limit is reached, additional requests behave as if long polling is disabled.
+    pub confirmation_long_poll_max_in_flight_requests: Option<usize>,
 }
 
 impl From<&StorageNodeConfig> for RestApiConfig {
@@ -119,6 +127,12 @@ impl From<&StorageNodeConfig> for RestApiConfig {
                 .rest_server
                 .experimental_max_active_recovery_symbols_requests,
             live_upload_deferral: config.live_upload_deferral.clone(),
+            confirmation_long_poll_max: Duration::from_millis(
+                config.rest_server.confirmation_long_poll_max_millis,
+            ),
+            confirmation_long_poll_max_in_flight_requests: config
+                .rest_server
+                .confirmation_long_poll_max_in_flight_requests,
         }
     }
 }
@@ -160,6 +174,7 @@ pub(crate) struct RestApiState<S> {
     service: Arc<S>,
     config: Arc<RestApiConfig>,
     recovery_symbols_limit: Option<Arc<Semaphore>>,
+    confirmation_long_poll_limit: Option<Arc<Semaphore>>,
 }
 
 impl<S> RestApiState<S> {
@@ -168,6 +183,9 @@ impl<S> RestApiState<S> {
             service,
             recovery_symbols_limit: config
                 .max_active_recovery_symbols_requests
+                .map(|limit| Arc::new(Semaphore::new(limit))),
+            confirmation_long_poll_limit: config
+                .confirmation_long_poll_max_in_flight_requests
                 .map(|limit| Arc::new(Semaphore::new(limit))),
             config,
         }
@@ -180,6 +198,7 @@ impl<S> Clone for RestApiState<S> {
             service: self.service.clone(),
             config: self.config.clone(),
             recovery_symbols_limit: self.recovery_symbols_limit.clone(),
+            confirmation_long_poll_limit: self.confirmation_long_poll_limit.clone(),
         }
     }
 }
@@ -190,7 +209,7 @@ pub struct RestApiServer<S> {
     state: RestApiState<S>,
     metrics: MetricsMiddlewareState,
     cancel_token: CancellationToken,
-    handle: Mutex<Option<Handle>>,
+    handle: Mutex<Option<Handle<SocketAddr>>>,
 }
 
 impl<S> RestApiServer<S>
@@ -267,7 +286,13 @@ where
             .map_err(|error| anyhow!(error))
     }
 
-    fn configure_server<A>(&self, mut server: axum_server::Server<A>) -> axum_server::Server<A> {
+    fn configure_server<Addr, A>(
+        &self,
+        mut server: axum_server::Server<Addr, A>,
+    ) -> axum_server::Server<Addr, A>
+    where
+        Addr: axum_server::Address,
+    {
         let config = &self.config().http2_config;
         let mut http2_builder = server.http_builder().http2();
         http2_builder
@@ -280,7 +305,7 @@ where
     }
 
     async fn handle_shutdown_signal(
-        handle: Handle,
+        handle: Handle<SocketAddr>,
         cancel_token: CancellationToken,
         shutdown_duration: Option<Duration>,
     ) {
@@ -304,7 +329,7 @@ where
         handle.graceful_shutdown(shutdown_duration);
     }
 
-    async fn init_handle(&self) -> Handle {
+    async fn init_handle(&self) -> Handle<SocketAddr> {
         let new_handle = Handle::new();
         let mut handle = self.handle.lock().await;
         *handle = Some(new_handle.clone());
@@ -525,7 +550,14 @@ mod tests {
         SliverPairIndex,
         SliverType,
         SymbolId,
-        encoding::{EitherDecodingSymbol, EncodingAxis, GeneralRecoverySymbol, Primary},
+        encoding::{
+            DecodingSymbol,
+            EitherDecodingSymbol,
+            EncodingAxis,
+            GeneralRecoverySymbol,
+            Primary,
+            Secondary,
+        },
         inconsistency::{
             InconsistencyProof as InconsistencyProofInner,
             InconsistencyVerificationError,
@@ -554,6 +586,7 @@ mod tests {
             StoredOnNodeStatus,
             errors::StatusCode as ApiStatusCode,
         },
+        client::DecodingSymbolsFilter,
     };
     use walrus_sui::test_utils::event_id_for_testing;
     use walrus_test_utils::{Result as TestResult, WithTempDir, async_param_test};
@@ -622,8 +655,8 @@ mod tests {
             _blob_id: &BlobId,
             _sliver_pair_index: SliverPairIndex,
             _sliver_type: SliverType,
-        ) -> Result<Sliver, RetrieveSliverError> {
-            Ok(walrus_core::test_utils::sliver())
+        ) -> Result<Arc<Sliver>, RetrieveSliverError> {
+            Ok(Arc::new(walrus_core::test_utils::sliver()))
         }
 
         async fn retrieve_multiple_recovery_symbols(
@@ -642,13 +675,37 @@ mod tests {
             Ok(vec![symbol.clone(), symbol])
         }
 
+        // A mock implementation returning a single decoding symbol for each target sliver.
+        // The returned symbols are also used to test the query sent to the server can be
+        // parsed correctly.
         async fn retrieve_multiple_decoding_symbols(
             &self,
             _blob_id: &BlobId,
-            _target_slivers: Vec<SliverIndex>,
-            _target_type: SliverType,
+            target_slivers: Vec<SliverIndex>,
+            target_type: SliverType,
         ) -> Result<BTreeMap<SliverIndex, Vec<EitherDecodingSymbol>>, ListSymbolsError> {
-            Ok(BTreeMap::new())
+            let mut result = BTreeMap::new();
+            for target_sliver in target_slivers {
+                match target_type {
+                    SliverType::Primary => {
+                        result.insert(
+                            target_sliver,
+                            vec![EitherDecodingSymbol::Primary(
+                                DecodingSymbol::<Primary>::new(target_sliver.0, vec![0]),
+                            )],
+                        );
+                    }
+                    SliverType::Secondary => {
+                        result.insert(
+                            target_sliver,
+                            vec![EitherDecodingSymbol::Secondary(
+                                DecodingSymbol::<Secondary>::new(target_sliver.0, vec![0]),
+                            )],
+                        );
+                    }
+                }
+            }
+            Ok(result)
         }
 
         /// Successful only for the pair index 0, otherwise, returns an internal error.
@@ -681,6 +738,15 @@ mod tests {
             } else {
                 Err(anyhow::anyhow!("Invalid shard").into())
             }
+        }
+
+        fn wait_for_registration(
+            &self,
+            blob_id: &BlobId,
+            _timeout: Duration,
+        ) -> impl std::future::Future<Output = bool> + Send {
+            let registered = blob_id.0[0] == 0;
+            async move { registered }
         }
 
         /// Returns a "certified" blob status for blob ID starting with zero, `Nonexistent` when
@@ -1041,7 +1107,7 @@ mod tests {
 
         let blob_id = blob_id_for_valid_response();
         let _confirmation = client
-            .get_confirmation(&blob_id, &BlobPersistenceType::Permanent)
+            .get_confirmation(&blob_id, &BlobPersistenceType::Permanent, None)
             .await
             .expect("should return a signed confirmation");
     }
@@ -1057,7 +1123,7 @@ mod tests {
         let client = storage_node_client(config.as_ref());
 
         let err = client
-            .get_confirmation(&blob_id, &BlobPersistenceType::Permanent)
+            .get_confirmation(&blob_id, &BlobPersistenceType::Permanent, None)
             .await
             .expect_err("confirmation request should fail");
 
@@ -1165,10 +1231,26 @@ mod tests {
             key_pair: &NetworkKeyPair,
             public_server_name: String,
         ) -> TestResult<(CertifiedKey, RcGenCertificate)> {
+            create_non_self_signed_certificate_that_may_be_expired(
+                key_pair,
+                public_server_name,
+                /*is_expired = */ false,
+            )
+        }
+
+        fn create_non_self_signed_certificate_that_may_be_expired(
+            key_pair: &NetworkKeyPair,
+            public_server_name: String,
+            is_expired: bool,
+        ) -> TestResult<(CertifiedKey, RcGenCertificate)> {
             let pkcs8_key_pair = to_pkcs8_key_pair(key_pair);
             let issuer = generate_issuer_certificate()?;
 
-            let params = CertificateParams::new(vec![public_server_name])?;
+            let mut params = CertificateParams::new(vec![public_server_name])?;
+            if is_expired {
+                params.not_after = params.not_after.replace_year(1970).unwrap();
+            }
+
             let certificate = params.signed_by(&pkcs8_key_pair, &issuer.cert, &issuer.key_pair)?;
 
             let certified_key = CertifiedKey {
@@ -1243,6 +1325,34 @@ mod tests {
                 &network_key_pair,
                 rest_api_address.ip().to_string(),
             )?;
+
+            configure_certificates_from_disk(certified_key_pair, &mut config)?;
+            start_rest_api_with_config(config.as_ref()).await;
+
+            let client = default_storage_node_client_builder()
+                .add_root_certificate(issuer_cert.der())
+                .authenticate_with_public_key(network_key_pair.public().clone())
+                .build(&rest_api_address.to_string())
+                .expect("must be able to construct client in tests");
+
+            try_tls_request(client).await?;
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn client_accepts_expired_non_self_signed_certificates_with_pinned_key() -> TestResult
+        {
+            let mut config = test_utils::storage_node_config();
+            let network_key_pair = config.as_ref().network_key_pair().clone();
+            let rest_api_address = config.as_ref().rest_api_address;
+
+            let (certified_key_pair, issuer_cert) =
+                create_non_self_signed_certificate_that_may_be_expired(
+                    &network_key_pair,
+                    rest_api_address.ip().to_string(),
+                    /*is_expired = */ true,
+                )?;
 
             configure_certificates_from_disk(certified_key_pair, &mut config)?;
             start_rest_api_with_config(config.as_ref()).await;
@@ -1378,5 +1488,45 @@ mod tests {
             .expect("Rustls must recognise key as valid");
 
         Ok(())
+    }
+
+    // Test the query sent to the server can be parsed correctly.
+    async_param_test! {
+        list_decoding_symbols: [
+            primary: (SliverType::Primary),
+            secondary: (SliverType::Secondary),
+        ]
+    }
+    async fn list_decoding_symbols(sliver_type: SliverType) {
+        let _ = tracing_subscriber::fmt::try_init();
+        let (config, _handle) = start_rest_api_with_test_config().await;
+
+        tracing::debug!("config: {:?}", config.as_ref());
+        let client = storage_node_client(config.as_ref());
+        let blob_id = walrus_core::test_utils::random_blob_id();
+
+        let filter = DecodingSymbolsFilter {
+            target_slivers: vec![SliverIndex(17), SliverIndex(28)],
+            target_type: sliver_type,
+        };
+
+        let result = client
+            .list_decoding_symbols(&blob_id, &filter)
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get(&SliverIndex(17)).unwrap().len(), 1);
+        assert_eq!(result.get(&SliverIndex(28)).unwrap().len(), 1);
+        match sliver_type {
+            SliverType::Primary => {
+                assert!(result.get(&SliverIndex(17)).unwrap()[0].is_primary());
+                assert!(result.get(&SliverIndex(28)).unwrap()[0].is_primary());
+            }
+            SliverType::Secondary => {
+                assert!(result.get(&SliverIndex(17)).unwrap()[0].is_secondary());
+                assert!(result.get(&SliverIndex(28)).unwrap()[0].is_secondary());
+            }
+        }
     }
 }

@@ -172,10 +172,10 @@ impl LazyClientBuilder<FallibleRpcClient> for LazyFallibleRpcClientBuilder {
         }
     }
 
-    fn get_rpc_url(&self) -> Option<&str> {
+    fn get_rpc_url(&self) -> &str {
         match self {
-            Self::Url { rpc_url, .. } => Some(rpc_url.as_str()),
-            Self::Client(client) => Some(client.get_rpc_url()),
+            Self::Url { rpc_url, .. } => rpc_url.as_str(),
+            Self::Client(client) => client.get_rpc_url(),
         }
     }
 }
@@ -304,6 +304,7 @@ impl RetriableRpcClient {
                     request_timeout,
                 )
                 .await
+                .map(CheckpointData::from)
                 .map_err(|status| CheckpointRpcError::from((status, sequence_number)).into())
         }
 

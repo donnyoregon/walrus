@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import React, { useEffect } from "react";
-import GlossaryProvider from "@site/src/components/Glossary/GlossaryProvider";
+import GlossaryProvider from "@site/src/shared/components/Glossary/GlossaryProvider";
 import "../css/fontawesome";
 
 export default function Root({ children }: { children: React.ReactNode }) {
@@ -183,5 +183,19 @@ export default function Root({ children }: { children: React.ReactNode }) {
         };
     }, []);
 
-    return <GlossaryProvider>{children}</GlossaryProvider>;
+    return (
+        <>
+            {/* Google Tag Manager (noscript) */}
+            <noscript>
+                <iframe
+                    src="https://www.googletagmanager.com/ns.html?id=GTM-M73JK866"
+                    height="0"
+                    width="0"
+                    style={{ display: 'none', visibility: 'hidden' }}
+                />
+            </noscript>
+            {/* End Google Tag Manager (noscript) */}
+            <GlossaryProvider>{children}</GlossaryProvider>
+        </>
+    );
 }

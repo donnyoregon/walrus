@@ -10,6 +10,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
+        Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -31,6 +32,7 @@ use futures::{
     stream::{self, FuturesOrdered},
 };
 use itertools::Either;
+use moka::{future::Cache, policy::EvictionPolicy};
 use node_recovery::NodeRecoveryHandler;
 use rand::{Rng, SeedableRng, rngs::StdRng, thread_rng};
 use recovery_symbol_service::{RecoverySymbolRequest, RecoverySymbolService};
@@ -46,7 +48,7 @@ use system_events::{CompletableHandle, EVENT_ID_FOR_CHECKPOINT_EVENTS, EventHand
 use thread_pool::{BoundedThreadPool, ThreadPoolBuilder};
 use tokio::{
     select,
-    sync::{Notify, watch},
+    sync::{Notify, RwLock, watch},
     time::Instant,
 };
 use tokio_metrics::TaskMonitor;
@@ -113,6 +115,7 @@ use walrus_sdk::{
             EpochChangeStart,
             GENESIS_EPOCH,
             PackageEvent,
+            ProtocolEvent,
         },
     },
 };
@@ -158,6 +161,7 @@ use self::{
     metrics::{NodeMetricSet, STATUS_PENDING, STATUS_PERSISTED, TelemetryLabel as _},
     pending_metadata_cache::PendingMetadataCache,
     pending_sliver_cache::{PendingSliverCache, PendingSliverCacheError},
+    registration_notifier::RegistrationNotifier,
     shard_sync::ShardSyncHandler,
     storage::{
         ShardStatus,
@@ -188,6 +192,7 @@ use crate::{
         config::LiveUploadDeferralConfig,
         event_blob_writer::EventBlobWriter,
         garbage_collector::GarbageCollector,
+        wal_price_monitor::WalPriceMonitor,
     },
     utils::ShardDiffCalculator,
 };
@@ -197,6 +202,8 @@ pub mod config;
 pub mod contract_service;
 pub mod dbtool;
 pub mod event_blob_writer;
+mod ref_counted_notify_map;
+mod registration_notifier;
 pub mod server;
 pub mod system_events;
 
@@ -211,6 +218,7 @@ mod blob_sync;
 mod config_synchronizer;
 mod epoch_change_driver;
 mod garbage_collector;
+mod network_overrides;
 mod node_recovery;
 mod pending_metadata_cache;
 mod pending_sliver_cache;
@@ -219,6 +227,7 @@ mod shard_sync;
 mod start_epoch_change_finisher;
 mod storage;
 mod thread_pool;
+mod wal_price_monitor;
 
 pub use config_synchronizer::{ConfigLoader, ConfigSynchronizer, StorageNodeConfigLoader};
 pub use garbage_collector::GarbageCollectionConfig;
@@ -291,7 +300,7 @@ pub trait ServiceState {
         blob_id: &BlobId,
         sliver_pair_index: SliverPairIndex,
         sliver_type: SliverType,
-    ) -> impl Future<Output = Result<Sliver, RetrieveSliverError>> + Send;
+    ) -> impl Future<Output = Result<Arc<Sliver>, RetrieveSliverError>> + Send;
 
     /// Stores the primary or secondary encoding for a blob for a shard held by this storage node.
     fn store_sliver(
@@ -309,6 +318,15 @@ pub trait ServiceState {
         blob_id: &BlobId,
         blob_persistence_type: &BlobPersistenceType,
     ) -> impl Future<Output = Result<StorageConfirmation, ComputeStorageConfirmationError>> + Send;
+
+    /// Waits for the blob registration event to be observed by the node.
+    ///
+    /// Returns true if the blob is registered before the timeout elapses.
+    fn wait_for_registration(
+        &self,
+        blob_id: &BlobId,
+        timeout: Duration,
+    ) -> impl Future<Output = bool> + Send;
 
     /// Verifies an inconsistency proof and provides a signed attestation for it, if valid.
     fn verify_inconsistency_proof(
@@ -450,6 +468,7 @@ impl StorageNodeBuilder {
         config: &StorageNodeConfig,
         metrics_registry: Registry,
     ) -> Result<StorageNode, anyhow::Error> {
+        tracing::info!("building storage node with config: {:#?}", config);
         let protocol_key_pair = config
             .protocol_key_pair
             .get()
@@ -570,6 +589,7 @@ pub struct StorageNode {
     garbage_collector: GarbageCollector,
     event_blob_writer_factory: Option<EventBlobWriterFactory>,
     config_synchronizer: Option<Arc<ConfigSynchronizer>>,
+    _wal_price_monitor: Option<WalPriceMonitor>,
 }
 
 type RecoveryDeferralEntry = (
@@ -577,7 +597,8 @@ type RecoveryDeferralEntry = (
     std::sync::Arc<tokio_util::sync::CancellationToken>,
 );
 type RecoveryDeferralMap = std::collections::HashMap<BlobId, RecoveryDeferralEntry>;
-type RecoveryDeferrals = std::sync::Arc<tokio::sync::RwLock<RecoveryDeferralMap>>;
+type RecoveryDeferrals = std::sync::Arc<RwLock<RecoveryDeferralMap>>;
+type SliverRefCacheKey = (BlobId, SliverPairIndex, SliverType);
 
 /// The internal state of a Walrus storage node.
 #[derive(Debug)]
@@ -595,6 +616,7 @@ pub struct StorageNodeInner {
     blocklist: Arc<Blocklist>,
     node_capability: ObjectID,
     blob_retirement_notifier: Arc<BlobRetirementNotifier>,
+    registration_notifier: Arc<RegistrationNotifier>,
     symbol_service: RecoverySymbolService,
     thread_pool: BoundedThreadPool,
     registry: Registry,
@@ -615,6 +637,7 @@ pub struct StorageNodeInner {
     recovery_deferral_notify: Arc<Notify>,
     recovery_deferral_cleanup_token: CancellationToken,
     live_upload_deferral_config: LiveUploadDeferralConfig,
+    sliver_ref_cache: Cache<SliverRefCacheKey, Arc<RwLock<Weak<Sliver>>>>,
 }
 
 /// Parameters for configuring and initializing a node.
@@ -747,6 +770,7 @@ impl StorageNode {
             blocklist: blocklist.clone(),
             node_capability: node_capability.id,
             blob_retirement_notifier: Arc::new(BlobRetirementNotifier::new(metrics.clone())),
+            registration_notifier: Arc::new(RegistrationNotifier::new()),
             symbol_service: RecoverySymbolService::new(
                 config.blob_recovery.max_proof_cache_elements,
                 encoding_config.clone(),
@@ -769,10 +793,15 @@ impl StorageNode {
             consistency_check_config: config.consistency_check.clone(),
             checkpoint_manager,
             garbage_collection_config: config.garbage_collection,
-            recovery_deferrals: std::sync::Arc::new(tokio::sync::RwLock::new(Default::default())),
+            recovery_deferrals: std::sync::Arc::new(RwLock::new(Default::default())),
             recovery_deferral_notify: Arc::new(Notify::new()),
             recovery_deferral_cleanup_token: CancellationToken::new(),
             live_upload_deferral_config: config.live_upload_deferral.clone(),
+            sliver_ref_cache: Cache::builder()
+                .name("sliver-refs")
+                .eviction_policy(EvictionPolicy::lru())
+                .max_capacity(config.sliver_reference_cache_max_entries)
+                .build(),
         });
 
         blocklist.start_refresh_task();
@@ -843,6 +872,16 @@ impl StorageNode {
             None
         };
 
+        // Initialize WAL price monitor if enabled
+        let wal_price_monitor = if config.wal_price_monitor.enable_wal_price_monitor {
+            Some(WalPriceMonitor::start(
+                config.wal_price_monitor.clone(),
+                metrics.clone(),
+            ))
+        } else {
+            None
+        };
+
         let garbage_collector =
             GarbageCollector::new(config.garbage_collection, inner.clone(), metrics);
 
@@ -858,6 +897,7 @@ impl StorageNode {
             garbage_collector,
             event_blob_writer_factory,
             config_synchronizer,
+            _wal_price_monitor: wal_price_monitor,
         })
     }
 
@@ -1508,6 +1548,11 @@ impl StorageNode {
             }
             EventStreamElement::ContractEvent(ContractEvent::DenyListEvent(_event)) => {
                 // TODO: Implement DenyListEvent handling (WAL-424)
+                event_handle.mark_as_complete();
+            }
+            EventStreamElement::ContractEvent(ContractEvent::ProtocolEvent(
+                ProtocolEvent::PricesUpdated(_),
+            )) => {
                 event_handle.mark_as_complete();
             }
             EventStreamElement::ContractEvent(ContractEvent::ProtocolEvent(event)) => {
@@ -3143,6 +3188,46 @@ impl StorageNodeInner {
             .is_some_and(|blob_info| blob_info.is_registered(self.current_committee_epoch())))
     }
 
+    fn notify_registration(&self, blob_id: &BlobId) {
+        self.registration_notifier.notify_registered(blob_id);
+    }
+
+    async fn wait_for_registration_inner(&self, blob_id: &BlobId, timeout: Duration) -> bool {
+        // TODO: For deletable blobs, confirmations are per-object (not per-blob). This wait is only
+        // blob scoped, so it can return `true` due to registration of a different object that
+        // references the same `BlobId`.
+        if timeout.is_zero() {
+            return self.is_blob_registered(blob_id).unwrap_or(false);
+        }
+
+        let notify = self.registration_notifier.acquire(blob_id);
+        let notified = notify.notified();
+
+        if self.is_blob_registered(blob_id).unwrap_or(false) {
+            return true;
+        }
+
+        // Only long-poll if we've actually buffered any data for this blob. This prevents clients
+        // from tying up the server by waiting on arbitrary blob IDs that the node hasn't seen.
+        //
+        // Note: this is best-effort; caches are bounded and time-based. If entries are evicted, we
+        // may skip waiting even if the blob later becomes registered.
+        if !self.pending_sliver_cache.has_blob(blob_id).await
+            && self.pending_metadata_cache.get(blob_id).await.is_none()
+        {
+            tracing::debug!(
+                %blob_id,
+                "wait_for_registration: skipping wait because no pending data is buffered"
+            );
+            return false;
+        }
+
+        match tokio::time::timeout(timeout, notified).await {
+            Ok(()) => self.is_blob_registered(blob_id).unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     fn is_blob_certified(&self, blob_id: &BlobId) -> Result<bool, anyhow::Error> {
         Ok(self
             .storage
@@ -3200,7 +3285,30 @@ impl StorageNodeInner {
         blob_id: &BlobId,
         sliver_pair_index: SliverPairIndex,
         sliver_type: SliverType,
-    ) -> Result<Sliver, RetrieveSliverError> {
+    ) -> Result<Arc<Sliver>, RetrieveSliverError> {
+        // Check the cache for the sliver before going to the database.
+        let key = (*blob_id, sliver_pair_index, sliver_type);
+        let cached_entry = self
+            .sliver_ref_cache
+            .get_with(key, async { Arc::new(RwLock::new(Weak::new())) })
+            .await;
+
+        if let Some(sliver) = cached_entry.read().await.upgrade() {
+            return Ok(sliver);
+        }
+
+        // The sliver was not cached, or the cached weak is no longer usable, so we need to fetch
+        // from the database. Before fetching, however, we need a write guard.
+        let mut weak_sliver_guard = cached_entry.write().await;
+
+        // It's possible that between us dropping the read guard and acquiring the write guard,
+        // another writer has already replaced the Weak with one that is still alive, so attempt to
+        // upgrade the pointer once more.
+        if let Some(sliver) = weak_sliver_guard.upgrade() {
+            return Ok(sliver);
+        }
+
+        // Okay, the weak that's stored really is not upgradeable, so access the database.
         let shard_storage = self
             .get_shard_for_sliver_pair(sliver_pair_index, blob_id)
             .await?;
@@ -3216,12 +3324,18 @@ impl StorageNodeInner {
         .await;
 
         match result {
-            Ok(result) => result.inspect(|sliver| {
+            Ok(Err(err)) => Err(err),
+            Ok(Ok(sliver)) => {
                 walrus_utils::with_label!(self.metrics.slivers_retrieved_total, sliver.r#type())
                     .inc();
-            }),
+                let shared_sliver = Arc::new(sliver);
+                *weak_sliver_guard = Arc::downgrade(&shared_sliver);
+
+                Ok(shared_sliver)
+            }
             Err(e) => {
                 if e.is_panic() {
+                    drop(weak_sliver_guard); // Because no need to panic while holding the guard.
                     std::panic::resume_unwind(e.into_panic());
                 }
                 Err(e)
@@ -3326,7 +3440,7 @@ impl StorageNodeInner {
     /// Returns a map of target sliver indexes to decoding symbols.
     fn extract_decoding_symbols_for_target_sliver_into_output<T: EncodingAxis>(
         &self,
-        sliver: SliverData<T>,
+        sliver: &SliverData<T>,
         target_sliver_indexes: &[SliverIndex],
     ) -> Result<BTreeMap<SliverIndex, EitherDecodingSymbol>, ListSymbolsError>
     where
@@ -3639,7 +3753,7 @@ impl ServiceState for StorageNode {
         blob_id: &BlobId,
         sliver_pair_index: SliverPairIndex,
         sliver_type: SliverType,
-    ) -> impl Future<Output = Result<Sliver, RetrieveSliverError>> + Send {
+    ) -> impl Future<Output = Result<Arc<Sliver>, RetrieveSliverError>> + Send {
         self.inner
             .retrieve_sliver(blob_id, sliver_pair_index, sliver_type)
     }
@@ -3663,6 +3777,14 @@ impl ServiceState for StorageNode {
     {
         self.inner
             .compute_storage_confirmation(blob_id, blob_persistence_type)
+    }
+
+    fn wait_for_registration(
+        &self,
+        blob_id: &BlobId,
+        timeout: Duration,
+    ) -> impl Future<Output = bool> + Send {
+        self.inner.wait_for_registration_inner(blob_id, timeout)
     }
 
     fn verify_inconsistency_proof(
@@ -3817,6 +3939,11 @@ impl ServiceState for StorageNodeInner {
         }
 
         if !intent.is_pending() {
+            tracing::debug!(
+                %blob_id,
+                ?intent,
+                "store_metadata: blob not registered and pending not allowed"
+            );
             return Err(StoreMetadataError::NotCurrentlyRegistered);
         }
 
@@ -3861,7 +3988,7 @@ impl ServiceState for StorageNodeInner {
         blob_id: &BlobId,
         sliver_pair_index: SliverPairIndex,
         sliver_type: SliverType,
-    ) -> Result<Sliver, RetrieveSliverError> {
+    ) -> Result<Arc<Sliver>, RetrieveSliverError> {
         self.check_index(sliver_pair_index)?;
 
         self.validate_blob_access(
@@ -3882,6 +4009,20 @@ impl ServiceState for StorageNodeInner {
         intent: UploadIntent,
     ) -> Result<bool, StoreSliverError> {
         self.check_index(sliver_pair_index)?;
+
+        let n_shards = self.n_shards();
+        let expected_pair_index = match sliver.r#type() {
+            SliverType::Primary => sliver.sliver_index().to_pair_index::<Primary>(n_shards),
+            SliverType::Secondary => sliver.sliver_index().to_pair_index::<Secondary>(n_shards),
+        };
+        ensure!(
+            sliver_pair_index == expected_pair_index,
+            StoreSliverError::SliverIndexMismatch {
+                sliver_pair_index,
+                sliver_index: sliver.sliver_index(),
+            }
+        );
+
         let (metadata_persisted, persisted) = self
             .resolve_metadata_for_sliver(&blob_id, intent.is_pending())
             .await?;
@@ -3890,6 +4031,13 @@ impl ServiceState for StorageNodeInner {
         if !encoding_type.is_supported() {
             return Err(StoreSliverError::UnsupportedEncodingType(encoding_type));
         }
+        tracing::debug!(
+            %blob_id,
+            ?sliver_pair_index,
+            ?intent,
+            ?metadata_persisted,
+            "store_sliver: resolved metadata for sliver"
+        );
 
         if persisted {
             // Metadata is already persisted, so the sliver can be written directly because
@@ -3912,6 +4060,12 @@ impl ServiceState for StorageNodeInner {
             .await
         {
             Ok(inserted) => {
+                tracing::debug!(
+                    %blob_id,
+                    ?sliver_pair_index,
+                    inserted,
+                    "store_sliver: buffered sliver in pending cache"
+                );
                 if self.is_blob_registered(&blob_id)? {
                     // Registration may arrive between the initial registration check and the point
                     // where we enqueue the sliver. If it does, flush everything immediately so the
@@ -3928,9 +4082,7 @@ impl ServiceState for StorageNodeInner {
 
                 Ok(inserted)
             }
-            Err(PendingSliverCacheError::SliverTooLarge) => {
-                Err(StoreSliverError::NotCurrentlyRegistered)
-            }
+            Err(PendingSliverCacheError::SliverTooLarge) => Err(StoreSliverError::CacheSaturated),
             Err(PendingSliverCacheError::Saturated) => Err(StoreSliverError::CacheSaturated),
         }
     }
@@ -3952,10 +4104,12 @@ impl ServiceState for StorageNodeInner {
         // Storage confirmation must use the last shard assignment, even though the node hasn't
         // processed to the latest epoch yet. This is because if the onchain committee has moved
         // on to the new epoch, confirmation from the old epoch is not longer valid.
+        let fully_stored = self
+            .is_stored_at_all_shards_at_latest_epoch(blob_id)
+            .await
+            .context("database error when checking storage status")?;
         ensure!(
-            self.is_stored_at_all_shards_at_latest_epoch(blob_id)
-                .await
-                .context("database error when checking storage status")?,
+            fully_stored,
             ComputeStorageConfirmationError::NotFullyStored,
         );
 
@@ -3981,6 +4135,14 @@ impl ServiceState for StorageNodeInner {
         self.metrics.storage_confirmations_issued_total.inc();
 
         Ok(StorageConfirmation::Signed(signed))
+    }
+
+    fn wait_for_registration(
+        &self,
+        blob_id: &BlobId,
+        timeout: Duration,
+    ) -> impl Future<Output = bool> + Send {
+        self.wait_for_registration_inner(blob_id, timeout)
     }
 
     fn blob_status(&self, blob_id: &BlobId) -> Result<BlobStatus, BlobStatusError> {
@@ -4141,11 +4303,12 @@ impl ServiceState for StorageNodeInner {
                 }
             };
 
-            let extracted_symbols = by_axis::flat_map!(sliver_result, |sliver| self
-                .extract_decoding_symbols_for_target_sliver_into_output(
-                    sliver,
-                    &target_sliver_indexes,
-                ))?;
+            let extracted_symbols =
+                by_axis::flat_map!(sliver_result.as_ref().as_ref(), |sliver| self
+                    .extract_decoding_symbols_for_target_sliver_into_output(
+                        sliver,
+                        &target_sliver_indexes,
+                    ))?;
 
             for (target_sliver_index, decoding_symbol) in extracted_symbols {
                 output
@@ -4274,14 +4437,16 @@ enum PendingCacheError {
 fn map_sliver_error_to_metadata(error: StoreSliverError) -> StoreMetadataError {
     match error {
         StoreSliverError::Internal(inner) => StoreMetadataError::Internal(inner),
-        StoreSliverError::NotCurrentlyRegistered | StoreSliverError::MissingMetadata => {
-            StoreMetadataError::NotCurrentlyRegistered
-        }
-        StoreSliverError::CacheSaturated => StoreMetadataError::CacheSaturated,
+        StoreSliverError::NotCurrentlyRegistered
+        | StoreSliverError::MissingMetadata
+        | StoreSliverError::CacheSaturated
+        | StoreSliverError::SliverTooLarge => StoreMetadataError::NotCurrentlyRegistered,
         StoreSliverError::UnsupportedEncodingType(kind) => {
             StoreMetadataError::UnsupportedEncodingType(kind)
         }
-        StoreSliverError::SliverOutOfRange(_) | StoreSliverError::InvalidSliver(_) => {
+        StoreSliverError::SliverOutOfRange(_)
+        | StoreSliverError::InvalidSliver(_)
+        | StoreSliverError::SliverIndexMismatch { .. } => {
             StoreMetadataError::Internal(anyhow!("sliver cache flush failed: {error:?}"))
         }
         StoreSliverError::ShardNotAssigned(inner) => StoreMetadataError::Internal(inner.into()),
@@ -4794,6 +4959,77 @@ mod tests {
         assert_eq!(stored_status, StoredOnNodeStatus::Stored);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn store_sliver_rejects_inconsistent_sliver_pair_index() -> TestResult {
+        let (cluster, _) = cluster_at_epoch1_without_blobs(&[&[0, 1, 2, 3]], None).await?;
+        let storage_node = cluster.nodes[0].storage_node.clone();
+        let encoding_config = storage_node.as_ref().inner.encoding_config.as_ref().clone();
+        let encoded = EncodedBlob::new(BLOB, encoding_config);
+        let blob_id = *encoded.blob_id();
+        let pair_0 = encoded.assigned_sliver_pair(SHARD_INDEX);
+        let pair_1 = encoded.assigned_sliver_pair(OTHER_SHARD_INDEX);
+
+        assert!(
+            storage_node
+                .as_ref()
+                .store_metadata(
+                    encoded.metadata.clone().into_unverified(),
+                    UploadIntent::Pending
+                )
+                .await?
+        );
+
+        // Primary sliver from pair 0 has sliver index 0, so it must be stored with pair index 0.
+        // Passing pair_1.index() is inconsistent and must be rejected.
+        let err = storage_node
+            .as_ref()
+            .store_sliver(
+                blob_id,
+                pair_1.index(),
+                Sliver::Primary(pair_0.primary.clone()),
+                UploadIntent::Pending,
+            )
+            .await
+            .expect_err("store_sliver must reject inconsistent sliver pair index");
+        assert!(
+            matches!(err, StoreSliverError::SliverIndexMismatch { .. }),
+            "expected SliverIndexMismatch, got {err:?}"
+        );
+
+        // Secondary sliver from pair 0 has sliver index n_shards-1 (for pair index 0).
+        // Passing pair_1.index() is inconsistent and must be rejected.
+        let err = storage_node
+            .as_ref()
+            .store_sliver(
+                blob_id,
+                pair_1.index(),
+                Sliver::Secondary(pair_0.secondary.clone()),
+                UploadIntent::Pending,
+            )
+            .await
+            .expect_err("store_sliver must reject inconsistent sliver pair index for secondary");
+        assert!(
+            matches!(err, StoreSliverError::SliverIndexMismatch { .. }),
+            "expected SliverIndexMismatch, got {err:?}"
+        );
+
+        // Consistent indices must be accepted.
+        for pair in [pair_0, pair_1] {
+            storage_node
+                .as_ref()
+                .store_sliver(
+                    blob_id,
+                    pair.index(),
+                    Sliver::Primary(pair.primary.clone()),
+                    UploadIntent::Pending,
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
     async fn check_sliver_status<A: EncodingAxis>(
         storage_node: &StorageNodeHandle,
         pair_index: SliverPairIndex,
@@ -6262,7 +6498,9 @@ mod tests {
 
         assert_eq!(
             blob.assigned_sliver_pair(ShardIndex(0)).primary,
-            sliver.try_into().expect("Sliver conversion failed.")
+            Arc::unwrap_or_clone(sliver)
+                .try_into()
+                .expect("Sliver conversion failed.")
         );
 
         Ok(())
@@ -8741,7 +8979,6 @@ mod tests {
                 .await?;
 
         let blob_id = *blob_detail[0].blob_id();
-        let encoding_config = cluster.encoding_config().get_for_type(EncodingType::RS2);
         let n_shards_nonzero = NonZero::new(n_shards).unwrap();
 
         // Retrieve recovery symbols from both nodes
@@ -8767,12 +9004,11 @@ mod tests {
                     })
                     .collect();
 
-                let symbol_size = blob_detail[0].pairs[0].primary.symbols.symbol_size();
-                let recovered_sliver = SliverData::recover_sliver_from_decoding_symbols(
+                let recovered_sliver = SliverData::try_recover_sliver_from_decoding_symbols(
                     recovery_symbols,
                     target_sliver_index,
-                    symbol_size,
-                    encoding_config,
+                    blob_detail[0].metadata.metadata(),
+                    &cluster.encoding_config(),
                 )?;
 
                 let target_pair_index =
@@ -8795,12 +9031,11 @@ mod tests {
                     })
                     .collect();
 
-                let symbol_size = blob_detail[0].pairs[0].secondary.symbols.symbol_size();
-                let recovered_sliver = SliverData::recover_sliver_from_decoding_symbols(
+                let recovered_sliver = SliverData::try_recover_sliver_from_decoding_symbols(
                     recovery_symbols,
                     target_sliver_index,
-                    symbol_size,
-                    encoding_config,
+                    blob_detail[0].metadata.metadata(),
+                    &cluster.encoding_config(),
                 )?;
 
                 let target_pair_index =

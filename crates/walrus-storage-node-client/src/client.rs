@@ -3,7 +3,7 @@
 
 //! Client for interacting with the StorageNode API.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use fastcrypto::traits::{EncodeDecodeBase64, KeyPair};
 use futures::TryFutureExt as _;
@@ -26,6 +26,7 @@ use walrus_core::{
     SliverType,
     SymbolId,
     encoding::{
+        EitherDecodingSymbol,
         EncodingAxis,
         EncodingConfig,
         GeneralRecoverySymbol,
@@ -85,6 +86,7 @@ const PERMANENT_BLOB_CONFIRMATION_URL_TEMPLATE: &str = "/v1/blobs/:blob_id/confi
 const DELETABLE_BLOB_CONFIRMATION_URL_TEMPLATE: &str =
     "/v1/blobs/:blob_id/confirmation/deletable/:object_id";
 const LIST_RECOVERY_SYMBOLS_URL_TEMPLATE: &str = "/v1/blobs/:blob_id/recoverySymbols";
+const LIST_DECODING_SYMBOLS_URL_TEMPLATE: &str = "/v1/blobs/:blob_id/decodingSymbols";
 const INCONSISTENCY_PROOF_URL_TEMPLATE: &str = "/v1/blobs/:blob_id/inconsistencyProof/:sliver_type";
 const BLOB_STATUS_URL_TEMPLATE: &str = "/v1/blobs/:blob_id/status";
 const HEALTH_URL_TEMPLATE: &str = "/v1/health";
@@ -197,6 +199,13 @@ impl UrlEndpoints {
         (
             self.blob_resource(blob_id, "recoverySymbols"),
             LIST_RECOVERY_SYMBOLS_URL_TEMPLATE,
+        )
+    }
+
+    fn list_decoding_symbols(&self, blob_id: &BlobId) -> (Url, &'static str) {
+        (
+            self.blob_resource(blob_id, "decodingSymbols"),
+            LIST_DECODING_SYMBOLS_URL_TEMPLATE,
         )
     }
 
@@ -333,6 +342,36 @@ where
     serializer.collect_map(symbols.iter().map(|id| ("id", id)))
 }
 
+/// Filter for [`StorageNodeClient::list_decoding_symbols()`] endpoint.
+#[derive(Debug, Clone)]
+pub struct DecodingSymbolsFilter {
+    /// The sliver indexes of the target slivers being recovered.
+    pub target_slivers: Vec<SliverIndex>,
+    /// The type of the sliver being recovered.
+    pub target_type: SliverType,
+}
+
+impl Serialize for DecodingSymbolsFilter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        // Use serde's name mangling to get camelCase field names
+        const TARGET_SLIVERS: &str = "targetSlivers";
+        const TARGET_TYPE: &str = "targetType";
+
+        let mut map = serializer.serialize_map(Some(self.target_slivers.len() + 1))?;
+        for sliver in &self.target_slivers {
+            // Serialize the inner u16 value directly, not the SliverIndex wrapper
+            map.serialize_entry(TARGET_SLIVERS, &sliver.0)?;
+        }
+        map.serialize_entry(TARGET_TYPE, &self.target_type)?;
+        map.end()
+    }
+}
+
 /// A client for communicating with a StorageNode.
 #[derive(Debug, Clone)]
 pub struct StorageNodeClient {
@@ -423,8 +462,17 @@ impl StorageNodeClient {
         &self,
         blob_id: &BlobId,
         blob_persistence_type: &BlobPersistenceType,
+        wait_for_registration: Option<Duration>,
     ) -> Result<SignedStorageConfirmation, NodeError> {
-        let (url, template) = self.endpoints.confirmation(blob_id, blob_persistence_type);
+        let (mut url, template) = self.endpoints.confirmation(blob_id, blob_persistence_type);
+        if let Some(wait_for_registration) = wait_for_registration.filter(|d| !d.is_zero()) {
+            url.query_pairs_mut()
+                .append_pair("wait_for_registration", "true")
+                .append_pair(
+                    "wait_millis",
+                    &wait_for_registration.as_millis().to_string(),
+                );
+        }
         // NOTE(giac): in the future additional values may be possible here.
         let StorageConfirmation::Signed(confirmation) = self
             .send_and_parse_service_response(Request::new(Method::GET, url), template)
@@ -450,7 +498,7 @@ impl StorageNodeClient {
         blob_persistence_type: BlobPersistenceType,
     ) -> Result<SignedStorageConfirmation, NodeError> {
         let confirmation = self
-            .get_confirmation(blob_id, &blob_persistence_type)
+            .get_confirmation(blob_id, &blob_persistence_type, None)
             .await?;
         let _ = confirmation
             .verify(public_key, epoch, *blob_id, blob_persistence_type)
@@ -641,12 +689,50 @@ impl StorageNodeClient {
         .map_err(|_| NodeError::other(ListAndVerifyRecoverySymbolsError::BackgroundWorkerFailed))?
     }
 
+    /// Gets multiple decoding symbols for recovering the specified target slivers.
+    /// This endpoint is meant to only serve symbols used to recover source slivers, and therefore
+    /// more suitable to be used by the client.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            walrus.blob_id = %blob_id,
+        ),
+        err(level = Level::DEBUG)
+    )]
+    pub async fn list_decoding_symbols(
+        &self,
+        blob_id: &BlobId,
+        filter: &DecodingSymbolsFilter,
+    ) -> Result<BTreeMap<SliverIndex, Vec<EitherDecodingSymbol>>, NodeError> {
+        let (url, template) = self.endpoints.list_decoding_symbols(blob_id);
+        let request = self
+            .client_clone
+            .get(url)
+            .query(&filter)
+            .build()
+            .expect("creating a URL from typed arguments should always succeed");
+        self.send_and_parse_bcs_response(request, template).await
+    }
+
     /// Stores the metadata on the node with the provided upload intent.
     #[tracing::instrument(
         skip_all, fields(walrus.blob_id = %metadata.blob_id(), walrus.intent = ?intent),
         err(level = Level::DEBUG)
     )]
     pub async fn store_metadata(
+        &self,
+        metadata: &VerifiedBlobMetadataWithId,
+        intent: UploadIntent,
+    ) -> Result<(), NodeError> {
+        self.store_metadata_with_intent(metadata, intent).await
+    }
+
+    /// Stores the metadata on the node with the provided upload intent.
+    #[tracing::instrument(
+        skip_all, fields(walrus.blob_id = %metadata.blob_id(), walrus.intent = ?intent),
+        err(level = Level::DEBUG)
+    )]
+    pub async fn store_metadata_with_intent(
         &self,
         metadata: &VerifiedBlobMetadataWithId,
         intent: UploadIntent,
@@ -674,6 +760,28 @@ impl StorageNodeClient {
         err(level = Level::DEBUG)
     )]
     pub async fn store_sliver<A: EncodingAxis>(
+        &self,
+        blob_id: &BlobId,
+        pair_index: SliverPairIndex,
+        sliver: &SliverData<A>,
+        intent: UploadIntent,
+    ) -> Result<(), NodeError> {
+        self.store_sliver_with_intent(blob_id, pair_index, sliver, intent)
+            .await
+    }
+
+    /// Stores a sliver on a node with the provided upload intent.
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            walrus.blob_id = %blob_id,
+            walrus.sliver.pair_index = %pair_index,
+            walrus.sliver.type_ = %A::NAME,
+            walrus.intent = ?intent,
+        ),
+        err(level = Level::DEBUG)
+    )]
+    pub async fn store_sliver_with_intent<A: EncodingAxis>(
         &self,
         blob_id: &BlobId,
         pair_index: SliverPairIndex,
@@ -986,6 +1094,55 @@ mod tests {
     }
     fn recovery_symbols_filter_to_query(
         filter: RecoverySymbolsFilter,
+        expected_query: &str,
+    ) -> TestResult {
+        let request = reqwest::Client::new()
+            .get("https://node.com")
+            .query(&filter)
+            .build()
+            .expect("query should serialize successfully");
+
+        assert_eq!(
+            request.url().query().expect("query should be present"),
+            expected_query
+        );
+        Ok(())
+    }
+
+    param_test! {
+        decoding_symbols_filter_to_query -> TestResult: [
+            single_sliver_primary: (
+                DecodingSymbolsFilter {
+                    target_slivers: vec![SliverIndex(5)],
+                    target_type: SliverType::Primary,
+                },
+                "targetSlivers=5&targetType=primary"
+            ),
+            single_sliver_secondary: (
+                DecodingSymbolsFilter {
+                    target_slivers: vec![SliverIndex(10)],
+                    target_type: SliverType::Secondary,
+                },
+                "targetSlivers=10&targetType=secondary"
+            ),
+            multiple_slivers_primary: (
+                DecodingSymbolsFilter {
+                    target_slivers: vec![SliverIndex(1), SliverIndex(2), SliverIndex(3)],
+                    target_type: SliverType::Primary,
+                },
+                "targetSlivers=1&targetSlivers=2&targetSlivers=3&targetType=primary"
+            ),
+            multiple_slivers_secondary: (
+                DecodingSymbolsFilter {
+                    target_slivers: vec![SliverIndex(72), SliverIndex(18)],
+                    target_type: SliverType::Secondary,
+                },
+                "targetSlivers=72&targetSlivers=18&targetType=secondary"
+            )
+        ]
+    }
+    fn decoding_symbols_filter_to_query(
+        filter: DecodingSymbolsFilter,
         expected_query: &str,
     ) -> TestResult {
         let request = reqwest::Client::new()

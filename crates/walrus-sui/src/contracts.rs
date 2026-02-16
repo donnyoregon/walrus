@@ -116,10 +116,11 @@ impl FunctionTag<'_> {
     }
 }
 
-pub(crate) type TypeOriginMap = BTreeMap<(String, String), ObjectID>;
+/// Mapping from (module name, struct name) to package ID. This is used to look up the package ID.
+pub type TypeOriginMap = BTreeMap<(String, String), ObjectID>;
 
 /// Tag identifying contract structs based on their name and module.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct StructTag<'a> {
     /// Move struct name.
     pub name: &'a str,
@@ -131,8 +132,8 @@ impl StructTag<'_> {
     /// Returns a [`MoveStructTag`] for the identified struct with the given package ID.
     ///
     /// Use [`Self::to_move_struct_tag_with_type_map`] if the type origin map is available.
-    pub(crate) fn to_move_struct_tag_with_package(
-        &self,
+    pub fn to_move_struct_tag_with_package(
+        self,
         package: ObjectID,
         type_params: &[TypeTag],
     ) -> Result<MoveStructTag> {
@@ -150,8 +151,8 @@ impl StructTag<'_> {
 
     /// Converts a [`StructTag`] to a [`MoveStructTag`] using the matching package ID from the given
     /// type origin map.
-    pub(crate) fn to_move_struct_tag_with_type_map(
-        &self,
+    pub fn to_move_struct_tag_with_type_map(
+        self,
         type_origin_map: &TypeOriginMap,
         type_params: &[TypeTag],
     ) -> Result<MoveStructTag> {
@@ -177,19 +178,25 @@ impl fmt::Display for StructTag<'_> {
     }
 }
 
+/// Declares const [`StructTag`] or [`FunctionTag`] bindings for Move contract identifiers.
+///
+/// Usage:
+/// - `contract_ident!(struct module::Name)` — declares a `StructTag` const.
+/// - `contract_ident!(fn module::name)` — declares a `FunctionTag` const.
+#[macro_export]
 macro_rules! contract_ident {
     (struct $modname:ident::$itemname:ident) => {
         #[allow(non_upper_case_globals)]
-        #[doc=stringify!([StructTag] for the Move struct $modname::$itemname)]
-        pub const $itemname: StructTag = StructTag {
+        #[doc=stringify!([$crate::contracts::StructTag] for Move struct $modname::$itemname)]
+        pub const $itemname: $crate::contracts::StructTag = $crate::contracts::StructTag {
             module: stringify!($modname),
             name: stringify!($itemname),
         };
     };
     (fn $modname:ident::$itemname:ident) => {
         #[allow(non_upper_case_globals)]
-        #[doc=stringify!([FunctionTag] for the Move function $modname::$itemname)]
-        pub const $itemname: FunctionTag = FunctionTag {
+        #[doc=stringify!([$crate::contracts::FunctionTag] for Move function $modname::$itemname)]
+        pub const $itemname: $crate::contracts::FunctionTag = $crate::contracts::FunctionTag {
             module: stringify!($modname),
             name: stringify!($itemname),
             type_params: vec![],
@@ -199,7 +206,6 @@ macro_rules! contract_ident {
 
 /// Module for tags corresponding to the Move module `storage_resource`.
 pub mod storage_resource {
-    use super::*;
 
     contract_ident!(fn storage_resource::split_by_epoch);
     contract_ident!(fn storage_resource::split_by_size);
@@ -211,7 +217,6 @@ pub mod storage_resource {
 
 /// Module for tags corresponding to the Move module `system`.
 pub mod system {
-    use super::*;
 
     contract_ident!(struct system::System);
     contract_ident!(fn system::reserve_space);
@@ -225,21 +230,18 @@ pub mod system {
 
 /// Module for tags corresponding to the Move module `system_state_inner`.
 pub mod system_state_inner {
-    use super::*;
 
     contract_ident!(struct system_state_inner::SystemStateInnerV1);
 }
 
 /// Module for tags corresponding to the Move module `staking_pool`.
 pub mod staking_pool {
-    use super::*;
 
     contract_ident!(struct staking_pool::StakingPool);
 }
 
 /// Module for tags corresponding to the Move module `staking`.
 pub mod staking {
-    use super::*;
 
     contract_ident!(struct staking::Staking);
     contract_ident!(fn staking::register_candidate);
@@ -259,6 +261,7 @@ pub mod staking {
     contract_ident!(fn staking::set_governance_authorized);
     contract_ident!(fn staking::set_storage_price_vote);
     contract_ident!(fn staking::set_write_price_vote);
+    contract_ident!(fn staking::update_prices);
     contract_ident!(fn staking::set_node_capacity_vote);
     contract_ident!(fn staking::collect_commission);
     contract_ident!(fn staking::set_next_commission);
@@ -267,14 +270,12 @@ pub mod staking {
 
 /// Module for tags corresponding to the Move module `staking_inner`.
 pub mod staking_inner {
-    use super::*;
 
     contract_ident!(struct staking_inner::StakingInnerV1);
 }
 
 /// Module for tags corresponding to the Move module `init`.
 pub mod init {
-    use super::*;
 
     contract_ident!(fn init::initialize_walrus);
     contract_ident!(fn init::migrate);
@@ -282,7 +283,6 @@ pub mod init {
 
 /// Module for tags corresponding to the Move module `upgrade`.
 pub mod upgrade {
-    use super::*;
 
     contract_ident!(struct upgrade::EmergencyUpgradeCap);
     contract_ident!(struct upgrade::UpgradeManager);
@@ -294,21 +294,18 @@ pub mod upgrade {
 
 /// Module for tags corresponding to the Move module `staked_wal`.
 pub mod staked_wal {
-    use super::*;
 
     contract_ident!(struct staked_wal::StakedWal);
 }
 
 /// Module for tags corresponding to the Move module `committee`.
 pub mod committee {
-    use super::*;
 
     contract_ident!(struct committee::Committee);
 }
 
 /// Module for tags corresponding to the Move module `storage_node`.
 pub mod storage_node {
-    use super::*;
 
     contract_ident!(struct storage_node::StorageNodeInfo);
     contract_ident!(struct storage_node::StorageNodeCap);
@@ -316,7 +313,6 @@ pub mod storage_node {
 }
 /// Module for tags corresponding to the Move module `metadata`.
 pub mod metadata {
-    use super::*;
 
     contract_ident!(struct metadata::Metadata);
     contract_ident!(fn metadata::new);
@@ -325,7 +321,6 @@ pub mod metadata {
 
 /// Module for tags corresponding to the Move module `blob`.
 pub mod blob {
-    use super::*;
 
     contract_ident!(struct blob::Blob);
     contract_ident!(fn blob::burn);
@@ -337,7 +332,6 @@ pub mod blob {
 
 /// Module for tags corresponding to the Move module `shared_blob`.
 pub mod shared_blob {
-    use super::*;
 
     contract_ident!(struct shared_blob::SharedBlob);
     contract_ident!(fn shared_blob::new);
@@ -348,7 +342,6 @@ pub mod shared_blob {
 
 /// Module for tags corresponding to the Move module `blob_events`.
 pub mod events {
-    use super::*;
 
     contract_ident!(struct events::BlobCertified);
     contract_ident!(struct events::BlobRegistered);
@@ -366,11 +359,11 @@ pub mod events {
     contract_ident!(struct events::ContractUpgradeProposed);
     contract_ident!(struct events::ContractUpgradeQuorumReached);
     contract_ident!(struct events::ProtocolVersionUpdated);
+    contract_ident!(struct events::PricesUpdated);
 }
 
 /// Module for tags corresponding to the Move module `auth`.
 pub mod auth {
-    use super::*;
 
     contract_ident!(fn auth::authenticate_sender);
     contract_ident!(fn auth::authenticate_with_object);
@@ -380,14 +373,12 @@ pub mod auth {
 
 /// Module for tags corresponding to the Move module `extended_field`.
 pub mod extended_field {
-    use super::*;
 
     contract_ident!(struct extended_field::Key);
 }
 
 /// Module for tags corresponding to the Move module `node_metadata`.
 pub mod node_metadata {
-    use super::*;
 
     contract_ident!(fn node_metadata::new);
     contract_ident!(struct node_metadata::NodeMetadata);
@@ -395,7 +386,6 @@ pub mod node_metadata {
 
 /// Module for tags corresponding to the Move module `wal_exchange`.
 pub mod wal_exchange {
-    use super::*;
 
     contract_ident!(struct wal_exchange::AdminCap);
     contract_ident!(struct wal_exchange::Exchange);
@@ -421,7 +411,6 @@ pub mod wal_exchange {
 /// This module is only used for Walrus credits. Callsites to this module have been updated to be
 /// named "credits" in the rust codebase to avoid confusion with the `walrus_subsidies` module.
 pub mod credits {
-    use super::*;
 
     contract_ident!(struct subsidies::Subsidies);
     contract_ident!(struct subsidies::AdminCap);
@@ -437,7 +426,6 @@ pub mod credits {
 
 /// Module for tags corresponding to the Move module `walrus_subsidies`.
 pub mod walrus_subsidies {
-    use super::*;
 
     contract_ident!(struct walrus_subsidies::WalrusSubsidies);
     contract_ident!(struct walrus_subsidies::WalrusSubsidiesInnerV1);
@@ -450,14 +438,12 @@ pub mod walrus_subsidies {
 
 /// Module for tags corresponding to the Move module `dynamic_field` from the `sui` package.
 pub mod dynamic_field {
-    use super::*;
 
     contract_ident!(struct dynamic_field::Field);
 }
 
 /// Module for tags corresponding to the Move module `package` from the `sui` package.
 pub mod package {
-    use super::*;
 
     contract_ident!(struct package::UpgradeCap);
 }

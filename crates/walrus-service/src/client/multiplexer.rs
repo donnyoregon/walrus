@@ -17,6 +17,7 @@ use walrus_core::{
     BlobId,
     EncodingType,
     EpochCount,
+    QuiltPatchId,
     encoding::{
         ConsistencyCheckType,
         quilt_encoding::{QuiltStoreBlob, QuiltVersion},
@@ -31,7 +32,7 @@ use walrus_sdk::{
         responses::{BlobStoreResult, QuiltStoreResult},
     },
     config::ClientConfig,
-    error::ClientResult,
+    error::{ClientError, ClientErrorKind, ClientResult},
     store_optimizations::StoreOptimizations,
 };
 use walrus_sui::{
@@ -42,6 +43,7 @@ use walrus_sui::{
         SuiReadClient,
         retry_client::RetriableSuiClient,
     },
+    coin::Coin,
     config::load_wallet_context_from_path,
     types::move_structs::BlobWithAttribute,
     utils::create_wallet,
@@ -51,7 +53,7 @@ use walrus_utils::metrics::Registry;
 
 use super::{
     cli::PublisherArgs,
-    daemon::{WalrusReadClient, WalrusWriteClient},
+    daemon::{QuiltPatchItem, WalrusReadClient, WalrusWriteClient},
     refill::{RefillHandles, Refiller},
 };
 use crate::client::refill::should_refill;
@@ -71,7 +73,7 @@ impl ClientMultiplexer {
         prometheus_registry: &Registry,
         args: &PublisherArgs,
     ) -> anyhow::Result<Self> {
-        let sui_env = wallet.get_active_env()?.clone();
+        let sui_env = wallet.get_active_env().clone();
         let contract_client = config.new_contract_client(wallet, gas_budget).await?;
         let main_address = contract_client.address();
 
@@ -189,6 +191,48 @@ impl WalrusReadClient for ClientMultiplexer {
         blob_object_id: &ObjectID,
     ) -> ClientResult<BlobWithAttribute> {
         self.read_client.get_blob_by_object_id(blob_object_id).await
+    }
+
+    async fn get_blobs_by_quilt_patch_ids(
+        &self,
+        quilt_patch_ids: &[QuiltPatchId],
+    ) -> ClientResult<Vec<QuiltStoreBlob<'static>>> {
+        self.read_client
+            .get_blobs_by_quilt_patch_ids(quilt_patch_ids)
+            .await
+    }
+
+    async fn get_patch_by_quilt_id_and_identifier(
+        &self,
+        quilt_id: &BlobId,
+        identifier: &str,
+    ) -> ClientResult<QuiltStoreBlob<'static>> {
+        self.read_client
+            .get_patch_by_quilt_id_and_identifier(quilt_id, identifier)
+            .await
+    }
+
+    async fn list_patches_in_quilt(&self, quilt_id: &BlobId) -> ClientResult<Vec<QuiltPatchItem>> {
+        self.read_client.list_patches_in_quilt(quilt_id).await
+    }
+
+    /// Streaming is not supported through the ClientMultiplexer.
+    ///
+    /// The multiplexer manages multiple write clients for parallelism, but the read client
+    /// is stored directly (not in an Arc) which is incompatible with the streaming API that
+    /// requires `Arc<Self>` for background prefetch tasks.
+    ///
+    /// For streaming blob downloads, use the aggregator endpoint directly:
+    /// `GET /v1alpha/blobs/{blob_id}/stream`
+    async fn stream_blob(
+        self: Arc<Self>,
+        _blob_id: &BlobId,
+    ) -> ClientResult<(super::daemon::BlobStream, u64)> {
+        Err(ClientError::from(ClientErrorKind::Other(
+            "streaming not supported through ClientMultiplexer; \
+                use the aggregator /v1alpha/blobs/{blob_id}/stream endpoint instead"
+                .into(),
+        )))
     }
 }
 
@@ -442,10 +486,10 @@ impl<'a> SubClientLoader<'a> {
         min_balance: u64,
     ) -> anyhow::Result<()> {
         let wal_coin_type = self.refiller.wal_coin_type();
-        let address = wallet.active_address()?;
+        let address = wallet.active_address();
         tracing::debug!(%address, "refilling sub-wallet with SUI and WAL");
 
-        let rpc_urls = &[wallet.get_rpc_url()?];
+        let rpc_urls = &[wallet.get_rpc_url()];
 
         let sui_client = RetriableSuiClient::new_for_rpc_urls(
             rpc_urls,
@@ -453,13 +497,13 @@ impl<'a> SubClientLoader<'a> {
             self.config.communication_config.sui_client_request_timeout,
         )?;
 
-        if should_refill(&sui_client, address, None, min_balance).await {
+        if should_refill(&sui_client, address, Coin::SUI, min_balance).await {
             self.refiller.send_gas_request(address).await?;
         } else {
             tracing::debug!(%address, "sub-wallet has enough SUI, skipping refill");
         }
 
-        if should_refill(&sui_client, address, Some(wal_coin_type), min_balance).await {
+        if should_refill(&sui_client, address, wal_coin_type, min_balance).await {
             self.refiller.send_wal_request(address).await?;
         } else {
             tracing::debug!(%address, "sub-wallet has enough WAL, skipping refill");

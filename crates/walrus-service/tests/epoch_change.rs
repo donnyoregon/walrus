@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Contains end-to-end tests for the epoch change mechanism.
-
+#![recursion_limit = "256"]
 #[ignore = "ignore E2E tests by default"]
 #[cfg(msim)]
 #[walrus_proc_macros::walrus_simtest]
@@ -15,7 +15,7 @@ async fn nodes_drive_epoch_change() -> walrus_test_utils::Result {
 
     walrus_test_utils::init_tracing();
     let epoch_duration = Duration::from_secs(5);
-    let (_sui, storage_nodes, _, _) = test_cluster::E2eTestSetupBuilder::new()
+    let (_sui, storage_nodes, _, _, _) = test_cluster::E2eTestSetupBuilder::new()
         .with_epoch_duration(epoch_duration)
         .with_test_nodes_config(
             TestNodesConfig::builder()

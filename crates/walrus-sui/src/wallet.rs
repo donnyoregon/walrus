@@ -8,28 +8,35 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use sui_package_management::LockCommand;
-use sui_sdk::{
-    rpc_types::{SuiObjectData, SuiTransactionBlockResponse},
-    sui_client_config::SuiEnv,
-    wallet_context::WalletContext,
-};
+use anyhow::Result;
+use move_package_alt::schema::Environment;
+use move_package_alt_compilation::build_config::BuildConfig as MoveBuildConfig;
+use sui_package_alt::find_environment;
+use sui_rpc_api::client::ExecutedTransaction;
+use sui_sdk::{sui_client_config::SuiEnv, wallet_context::WalletContext};
 use sui_types::{
     base_types::{ObjectID, ObjectRef, SuiAddress},
     crypto::EmptySignInfo,
     message_envelope::Envelope,
+    object::Object,
     transaction::{SenderSignedData, Transaction, TransactionData},
 };
 
 /// The `Wallet` struct wraps the `WalletContext` from the Sui SDK. This allows us to
 /// reduce the scope of the `WalletContext` to only the methods we need.
 pub struct Wallet {
+    active_address: SuiAddress,
+    active_env: SuiEnv,
+    config_path: PathBuf,
     wallet_context: WalletContext,
 }
 
 impl std::fmt::Debug for Wallet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Wallet").finish()
+        f.debug_struct("Wallet")
+            .field("active_address", &self.active_address)
+            .field("active_env", &self.active_env)
+            .finish()
     }
 }
 
@@ -39,13 +46,18 @@ pub type WalletError = anyhow::Error;
 
 impl Wallet {
     /// Create a new Wallet.
-    pub fn new(wallet_context: WalletContext) -> Self {
-        Self { wallet_context }
+    pub fn new(mut wallet_context: WalletContext) -> Result<Self, WalletError> {
+        Ok(Self {
+            active_address: wallet_context.active_address()?,
+            active_env: wallet_context.config.get_active_env()?.clone(),
+            config_path: wallet_context.config.path().to_path_buf(),
+            wallet_context,
+        })
     }
 
-    /// Passes through to the `WalletContext` to get the active address.
-    pub fn active_address(&mut self) -> Result<SuiAddress, WalletError> {
-        self.wallet_context.active_address()
+    /// Get the active address.
+    pub fn active_address(&self) -> SuiAddress {
+        self.active_address
     }
 
     /// Passes through to the `WalletContext` to sign a transaction.
@@ -73,7 +85,7 @@ impl Wallet {
     pub async fn execute_transaction_may_fail(
         &self,
         signed_transaction: Envelope<SenderSignedData, EmptySignInfo>,
-    ) -> Result<SuiTransactionBlockResponse, WalletError> {
+    ) -> Result<ExecutedTransaction, WalletError> {
         self.wallet_context
             .execute_transaction_may_fail(signed_transaction)
             .await
@@ -87,45 +99,39 @@ impl Wallet {
         address: SuiAddress,
         budget: u64,
         forbidden_gas_objects: BTreeSet<ObjectID>,
-    ) -> Result<(u64, SuiObjectData), WalletError> {
+    ) -> Result<(u64, Object), WalletError> {
         self.wallet_context
             .gas_for_owner_budget(address, budget, forbidden_gas_objects)
             .await
     }
 
-    /// Update the `Move.lock` file with automated address management info. See
-    /// [`sui_package_management::update_lock_file`] for details.
-    // TODO: WAL-821 After we bring in Sui v1.50, we should remove this method in favor of
-    // update_lock_file_for_chain_env.
-    pub async fn update_lock_file(
-        &self,
-        lock_command: LockCommand,
-        install_dir: Option<PathBuf>,
-        lock_file: Option<PathBuf>,
-        response: &SuiTransactionBlockResponse,
-    ) -> Result<(), WalletError> {
-        sui_package_management::update_lock_file(
-            &self.wallet_context,
-            lock_command,
-            install_dir,
-            lock_file,
-            response,
-        )
-        .await
-    }
-
     /// Get the rpc_url for the active environment.
-    pub fn get_rpc_url(&self) -> Result<String, WalletError> {
-        Ok(self.wallet_context.config.get_active_env()?.rpc.clone())
+    pub fn get_rpc_url(&self) -> &str {
+        &self.active_env.rpc
     }
 
     /// Get the path to the wallet configuration file.
     pub fn get_config_path(&self) -> &Path {
-        self.wallet_context.config.path()
+        &self.config_path
     }
 
     /// Get the active environment.
-    pub fn get_active_env(&self) -> Result<&SuiEnv, WalletError> {
-        self.wallet_context.config.get_active_env()
+    pub fn get_active_env(&self) -> &SuiEnv {
+        &self.active_env
+    }
+
+    /// Constructs the environment for the package management system based on the package path,
+    /// the build config, and the wallet context.
+    pub async fn find_package_environment(
+        &self,
+        package_path: &Path,
+        build_config: &MoveBuildConfig,
+    ) -> Result<Environment, WalletError> {
+        find_environment(
+            package_path,
+            build_config.environment.clone(),
+            &self.wallet_context,
+        )
+        .await
     }
 }

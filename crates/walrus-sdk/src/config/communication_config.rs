@@ -71,6 +71,12 @@ pub const DEFAULT_AUTO_TUNE_MAX_PERMITS: usize = 2_000;
 pub const DEFAULT_AUTO_TUNE_SECONDARY_WEIGHT: f64 = 0.5;
 /// Default minimum blob size (in bytes) required to enable auto-tune.
 pub const DEFAULT_AUTO_TUNE_MIN_BLOB_SIZE_BYTES: u64 = 50 * 1024 * 1024; // 50MB
+/// Default maximum unencoded blob size (in bytes) for optimistic uploads.
+pub const DEFAULT_OPTIMISTIC_UPLOAD_MAX_BLOB_BYTES: u64 = 4 * 1024 * 1024;
+
+fn default_optimistic_upload_max_blob_bytes() -> u64 {
+    DEFAULT_OPTIMISTIC_UPLOAD_MAX_BLOB_BYTES
+}
 
 /// Configuration for runtime auto-tuning of the data-in-flight limit.
 #[serde_as]
@@ -195,6 +201,26 @@ pub struct ClientCommunicationConfig {
     /// Optional preset that adjusts concurrency limits unless explicit overrides are provided.
     #[serde(default = "default_upload_mode")]
     pub upload_mode: Option<UploadMode>,
+    /// Allow pending (optimistic) uploads before registration is seen by storage nodes.
+    #[serde(default)]
+    pub pending_uploads_enabled: bool,
+    /// Grace period to allow pending uploads to continue after registration completes.
+    ///
+    /// Set to 0 to cancel immediately once registration finishes.
+    #[serde(default)]
+    #[serde(rename = "pending_upload_grace_millis")]
+    #[serde_as(as = "DurationMilliSeconds")]
+    pub pending_upload_grace: Duration,
+    /// Maximum time to long-poll confirmation requests for registration events.
+    ///
+    /// Set to 0 to disable long polling.
+    #[serde(default)]
+    #[serde(rename = "confirmation_long_poll_millis")]
+    #[serde_as(as = "DurationMilliSeconds")]
+    pub confirmation_long_poll: Duration,
+    /// Maximum unencoded blob size (in bytes) to consider for optimistic uploads.
+    #[serde(default = "default_optimistic_upload_max_blob_bytes")]
+    pub optimistic_upload_max_blob_bytes: u64,
     /// The delay for which the client waits before storing data to ensure that storage nodes have
     /// seen the registration event.
     #[serde(rename = "registration_delay_millis")]
@@ -228,6 +254,10 @@ impl Default for ClientCommunicationConfig {
             tail_handling: TailHandling::Blocking,
             data_in_flight_auto_tune: Default::default(),
             upload_mode: default_upload_mode(),
+            pending_uploads_enabled: false,
+            pending_upload_grace: Duration::from_millis(0),
+            confirmation_long_poll: Duration::from_millis(0),
+            optimistic_upload_max_blob_bytes: DEFAULT_OPTIMISTIC_UPLOAD_MAX_BLOB_BYTES,
             registration_delay: Duration::from_millis(200),
             max_total_blob_size: 1024 * 1024 * 1024, // 1GiB
             sliver_status_check_threshold: DEFAULT_SLIVER_STATUS_CHECK_THRESHOLD,
@@ -254,6 +284,7 @@ impl ClientCommunicationConfig {
         ClientCommunicationConfig {
             disable_proxy: true,
             disable_native_certs: true,
+            pending_uploads_enabled: true,
             request_rate_config: RequestRateConfig {
                 max_node_connections: 10,
                 backoff_config: ExponentialBackoffConfig {
@@ -385,7 +416,7 @@ impl CommunicationLimits {
         concurrency
     }
 
-    /// This computes the maximum number of concurrent sliver writes based on the unencoded blob
+    /// This computes the maximum number of concurrent sliver reads based on the unencoded blob
     /// size.
     ///
     /// This applies two limits:

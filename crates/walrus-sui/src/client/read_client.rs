@@ -9,7 +9,6 @@ use std::{
     future::Future,
     num::NonZeroU16,
     ops::ControlFlow,
-    path::PathBuf,
     sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::{Duration, SystemTime},
 };
@@ -20,7 +19,6 @@ use futures::FutureExt as _;
 use sui_sdk::{
     apis::EventApi,
     rpc_types::{
-        Coin,
         EventFilter,
         SuiEvent,
         SuiObjectData,
@@ -50,8 +48,9 @@ use super::{
     retry_client::RetriableSuiClient,
 };
 use crate::{
+    client::retry_client::retriable_sui_client::MAX_GAS_PAYMENT_OBJECTS,
+    coin::{Coin, CoinType},
     contracts::{self, AssociatedContractStruct, AssociatedContractStructWithPkgId, TypeOriginMap},
-    system_setup,
     types::{
         BlobEvent,
         Committee,
@@ -80,19 +79,10 @@ use crate::{
             WalrusSubsidiesInner,
         },
     },
-    utils::{get_sui_object_from_object_response, handle_pagination},
+    utils::{get_sui_object_from_bcs, handle_pagination},
 };
 
 const EVENT_MODULE: &str = "events";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// The type of coin.
-pub enum CoinType {
-    /// The WAL coin type.
-    Wal,
-    /// The SUI coin type.
-    Sui,
-}
 
 /// The current, previous, and next committee, and the current epoch state.
 ///
@@ -377,30 +367,16 @@ impl SuiReadClient {
         let system_object_id = contract_config.system_object;
         let staking_object_id = contract_config.staking_object;
 
-        let object_responses = sui_client
-            .multi_get_object_with_options(
-                &[system_object_id, staking_object_id],
-                SuiObjectDataOptions::new()
-                    .with_owner()
-                    .with_bcs()
-                    .with_type(),
-            )
+        let (
+            system_object_for_deserialization,
+            system_object_initial_version,
+            staking_object_for_deserialization,
+            staking_object_initial_version,
+        ) = sui_client
+            .fetch_system_and_staking_objects(system_object_id, staking_object_id)
             .await?;
-        let [system_object_response, staking_object_response] = object_responses.as_slice() else {
-            return Err(SuiClientError::Internal(anyhow::anyhow!(
-                "received an unexpected response when getting the system and staking objects",
-            )));
-        };
 
-        let system_object_for_deserialization: SystemObjectForDeserialization =
-            get_sui_object_from_object_response(system_object_response)?;
         let walrus_package_id = system_object_for_deserialization.package_id;
-        let system_object_initial_version =
-            sui_client.get_initial_version_from_object_response(system_object_response)?;
-        let staking_object_for_deserialization: StakingObjectForDeserialization =
-            get_sui_object_from_object_response(staking_object_response)?;
-        let staking_object_initial_version =
-            sui_client.get_initial_version_from_object_response(staking_object_response)?;
 
         let (system_object, staking_object, type_origin_map, wal_type) = tokio::try_join!(
             // Boxing the futures here to avoid making this future too large.
@@ -669,7 +645,8 @@ impl SuiReadClient {
             .expect("mutex should not be poisoned")
     }
 
-    pub(crate) fn type_origin_map(&self) -> RwLockReadGuard<'_, TypeOriginMap> {
+    /// Returns a read guard to the cached type origin map.
+    pub fn type_origin_map(&self) -> RwLockReadGuard<'_, TypeOriginMap> {
         self.type_origin_map
             .read()
             .expect("mutex should not be poisoned")
@@ -682,22 +659,14 @@ impl SuiReadClient {
     }
 
     /// Returns the balance of the owner for the given coin type.
-    pub(crate) async fn balance(
+    pub(crate) async fn total_balance(
         &self,
         owner_address: SuiAddress,
         coin_type: CoinType,
     ) -> SuiClientResult<u64> {
-        let coin_type_option = match coin_type {
-            CoinType::Wal => Some(self.wal_coin_type().to_owned()),
-            CoinType::Sui => None,
-        };
-        Ok(self
-            .sui_client
-            .get_balance(owner_address, coin_type_option)
-            .await?
-            .total_balance
-            .try_into()
-            .expect("balances should fit into a u64"))
+        self.sui_client
+            .get_total_balance(owner_address, coin_type.as_str(self.wal_coin_type()))
+            .await
     }
 
     /// Returns a vector of coins of provided `coin_type` whose total balance is at least `balance`.
@@ -712,12 +681,14 @@ impl SuiReadClient {
         min_balance: u64,
         exclude: Vec<ObjectID>,
     ) -> SuiClientResult<Vec<Coin>> {
-        let coin_type_option = match coin_type {
-            CoinType::Wal => Some(self.wal_coin_type().to_owned()),
-            CoinType::Sui => None,
-        };
         self.sui_client
-            .select_coins(owner_address, coin_type_option, min_balance.into(), exclude)
+            .select_coins(
+                owner_address,
+                coin_type.as_str(self.wal_coin_type()),
+                min_balance.into(),
+                exclude,
+                MAX_GAS_PAYMENT_OBJECTS,
+            )
             .await
             .map_err(|err| match err {
                 SuiClientError::SuiSdkError(sui_sdk::error::Error::InsufficientFund {
@@ -729,21 +700,6 @@ impl SuiReadClient {
                 },
                 err => err,
             })
-    }
-
-    /// Returns the digest of the package at `package_path` for the currently active sui network.
-    pub async fn compute_package_digest(&self, package_path: PathBuf) -> SuiClientResult<[u8; 32]> {
-        // Compile package to get the digest.
-        let chain_id = self
-            .retriable_sui_client()
-            .get_chain_identifier()
-            .await
-            .ok();
-        tracing::info!(?chain_id, "chain identifier");
-        let (compiled_package, _build_config) =
-            system_setup::compile_package(package_path, Default::default(), chain_id).await?;
-        let digest = compiled_package.get_package_digest(false);
-        Ok(digest)
     }
 
     pub(crate) async fn get_compatible_gas_coins(
@@ -1210,7 +1166,7 @@ impl SuiReadClient {
     }
 
     /// Returns the backoff configuration for the inner client.
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn backoff_config(&self) -> &ExponentialBackoffConfig {
         self.sui_client.backoff_config()
     }
@@ -1280,6 +1236,7 @@ impl ReadClient for SuiReadClient {
             .sui_client
             .get_current_client()
             .await
+            .sui_client()
             .event_api()
             .clone();
 
@@ -1342,7 +1299,7 @@ impl ReadClient for SuiReadClient {
     }
 
     async fn get_storage_nodes_by_ids(&self, node_ids: &[ObjectID]) -> Result<Vec<StorageNode>> {
-        self.sui_client.get_storage_nodes_by_ids(node_ids).await
+        Ok(self.sui_client.get_storage_nodes_by_ids(node_ids).await?)
     }
 
     async fn get_blob_attribute(
@@ -1356,26 +1313,26 @@ impl ReadClient for SuiReadClient {
         &self,
         blob_object_id: &ObjectID,
     ) -> SuiClientResult<BlobWithAttribute> {
-        let blob_object_response = self
+        let blob: Blob = self
             .sui_client
-            .get_object_with_options(
-                *blob_object_id,
-                SuiObjectDataOptions::new().with_bcs().with_type(),
-            )
+            .get_move_object_from_bcs(*blob_object_id, |object_id, struct_tag, bcs| {
+                Ok(
+                    if let Ok(blob) = get_sui_object_from_bcs::<Blob>(bcs, struct_tag) {
+                        blob
+                    } else {
+                        let shared_blob = get_sui_object_from_bcs::<SharedBlob>(
+                            bcs, struct_tag,
+                        )
+                        .with_context(|| {
+                            format!(
+                                "could not retrieve blob or shared blob from object id {object_id}"
+                            )
+                        })?;
+                        shared_blob.blob
+                    },
+                )
+            })
             .await?;
-        let blob = if let Ok(blob) =
-            get_sui_object_from_object_response::<Blob>(&blob_object_response)
-        {
-            blob
-        } else {
-            let shared_blob = get_sui_object_from_object_response::<SharedBlob>(
-                &blob_object_response,
-            )
-            .map_err(|_| {
-                anyhow!("could not retrieve blob or shared blob from object id {blob_object_id}")
-            })?;
-            shared_blob.blob
-        };
         let attribute = self.get_blob_attribute(&blob.id).await?;
         Ok(BlobWithAttribute { blob, attribute })
     }

@@ -49,6 +49,18 @@ public(package) fun create_empty(max_epochs_ahead: u32, package_id: ID, ctx: &mu
     transfer::share_object(system);
 }
 
+/// Sets the storage price per unit size. Called when a price vote is cast and the quorum
+/// price is recalculated from the current committee.
+public(package) fun set_storage_price(self: &mut System, price: u64) {
+    self.inner_mut().set_storage_price(price);
+}
+
+/// Sets the write price per unit size. Called when a price vote is cast and the quorum
+/// price is recalculated from the current committee.
+public(package) fun set_write_price(self: &mut System, price: u64) {
+    self.inner_mut().set_write_price(price);
+}
+
 /// Update epoch to next epoch, and update the committee, price and capacity.
 ///
 /// Called by the epoch change function that connects `Staking` and `System`. Returns
@@ -59,6 +71,12 @@ public(package) fun advance_epoch(
     new_epoch_params: &EpochParams,
 ): VecMap<ID, Balance<WAL>> {
     self.inner_mut().advance_epoch(new_committee, new_epoch_params)
+}
+
+/// Extracts the balance that will be burned for the current epoch. This function is used when
+/// executing the epoch change.
+public(package) fun extract_burn_balance(self: &mut System): Balance<WAL> {
+    self.inner_mut().extract_burn_balance()
 }
 
 /// === Public Functions ===
@@ -375,8 +393,20 @@ public(package) fun new_package_id(system: &System): Option<ID> {
 }
 
 #[test_only]
+/// Returns the raw storage price per unit size.
+public fun storage_price_per_unit_size(self: &System): u64 {
+    self.inner().storage_price_per_unit_size()
+}
+
+#[test_only]
+/// Returns the raw write price per unit size.
+public fun write_price_per_unit_size(self: &System): u64 {
+    self.inner().write_price_per_unit_size()
+}
+
+#[test_only]
 public(package) fun destroy_for_testing(self: System) {
-    sui::test_utils::destroy(self);
+    std::unit_test::destroy(self);
 }
 
 #[test_only]

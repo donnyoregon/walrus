@@ -11,87 +11,120 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use move_core_types::account_address::AccountAddress;
-use move_package::BuildConfig as MoveBuildConfig;
-use sui_move_build::{
-    BuildConfig,
-    CompiledPackage,
-    build_from_resolution_graph,
-    check_invalid_dependencies,
-    check_unpublished_dependencies,
-    gather_published_ids,
+use move_core_types::language_storage::StructTag;
+use move_package_alt::{
+    RootPackage,
+    schema::{OriginalID, Publication, PublishAddresses, PublishedID},
 };
-use sui_sdk::{
-    rpc_types::{SuiExecutionStatus, SuiTransactionBlockEffectsAPI, SuiTransactionBlockResponse},
-    types::{
-        Identifier,
-        base_types::ObjectID,
-        programmable_transaction_builder::ProgrammableTransactionBuilder,
-        transaction::TransactionData,
-    },
+use move_package_alt_compilation::build_config::BuildConfig as MoveBuildConfig;
+use sui_move_build::{CompiledPackage, PackageDependencies};
+use sui_package_alt::{BuildParams, SuiFlavor};
+use sui_package_management::LockCommand;
+use sui_rpc_api::client::ExecutedTransaction;
+use sui_sdk::types::{
+    Identifier,
+    base_types::ObjectID,
+    programmable_transaction_builder::ProgrammableTransactionBuilder,
+    transaction::TransactionData,
 };
 use sui_types::{
     SUI_CLOCK_OBJECT_ID,
     SUI_CLOCK_OBJECT_SHARED_VERSION,
-    SUI_FRAMEWORK_ADDRESS,
+    effects::TransactionEffectsAPI,
+    execution_status::ExecutionStatus,
     transaction::{ObjectArg, SharedObjectMutability, TransactionKind},
 };
 use walkdir::WalkDir;
 use walrus_core::{EpochCount, ensure};
 
+#[cfg(any(test, feature = "test-utils"))]
+use crate::test_utils::system_setup;
 use crate::{
     client::retry_client::{
         RetriableSuiClient,
-        retriable_sui_client::{GasBudgetAndPrice, LazySuiClientBuilder},
+        retriable_sui_client::{GasBudgetAndPrice, LazySuiClientBuilder, MAX_GAS_PAYMENT_OBJECTS},
     },
-    contracts::{self, StructTag},
-    utils::{get_created_sui_object_ids_by_type, resolve_lock_file_path},
+    coin::Coin,
+    contracts,
     wallet::Wallet,
 };
 
-const INIT_MODULE: &str = "init";
+/// Gets the objects of the given type that were created in an [`ExecutedTransaction`].
+fn get_created_object_ids_by_type(
+    response: &ExecutedTransaction,
+    struct_tag: &StructTag,
+) -> Result<Vec<ObjectID>> {
+    use std::collections::HashSet;
 
-const INIT_CAP_TAG: StructTag<'_> = StructTag {
-    name: "InitCap",
-    module: INIT_MODULE,
-};
+    use sui_types::effects::TransactionEffectsAPI;
 
-const UPGRADE_CAP_TAG: StructTag<'_> = StructTag {
-    name: "UpgradeCap",
-    module: "package",
-};
-
-fn get_pkg_id_from_tx_response(tx_response: &SuiTransactionBlockResponse) -> Result<ObjectID> {
-    tx_response
+    let created_ids: HashSet<_> = response
         .effects
-        .as_ref()
-        .ok_or_else(|| anyhow!("could not read transaction effects"))?
         .created()
         .iter()
-        .find(|obj| obj.owner.is_immutable())
-        .map(|obj| obj.object_id())
-        .ok_or_else(|| anyhow!("no immutable object was created"))
+        .map(|(obj_ref, _)| obj_ref.0)
+        .collect();
+
+    let struct_tag_str = struct_tag.to_canonical_string(true);
+
+    Ok(response
+        .changed_objects
+        .iter()
+        .filter_map(|o| {
+            let id: ObjectID = o.object_id().parse().ok()?;
+            if created_ids.contains(&id) && o.object_type() == struct_tag_str {
+                Some(id)
+            } else {
+                None
+            }
+        })
+        .collect())
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+fn get_pkg_id_from_tx_response(tx_response: &ExecutedTransaction) -> Result<ObjectID> {
+    tx_response
+        .get_new_package_obj()
+        .map(|(id, _, _)| id)
+        .ok_or_else(|| anyhow!("no package object was created"))
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) async fn publish_package_with_default_build_config(
     wallet: &mut Wallet,
     package_path: PathBuf,
     gas_budget: Option<u64>,
-) -> Result<SuiTransactionBlockResponse> {
+) -> Result<ExecutedTransaction> {
     publish_package(wallet, package_path, Default::default(), gas_budget).await
 }
 
 /// Compiles a package and returns the compiled package, and build config.
+/// `env` is the environment to use for the package management system, and should be derived
+/// from the wallet that performs the publish/upgrade.
 pub async fn compile_package(
     package_path: PathBuf,
     build_config: MoveBuildConfig,
     chain_id: Option<String>,
-) -> Result<(CompiledPackage, MoveBuildConfig)> {
+    wallet: &Wallet,
+) -> Result<(CompiledPackage, MoveBuildConfig, RootPackage<SuiFlavor>)> {
+    let env = wallet
+        .find_package_environment(&package_path, &build_config)
+        .await?;
+
+    let build_config_clone = build_config.clone();
+    let package_path_clone = package_path.clone();
+
+    let root_pkg: RootPackage<SuiFlavor> = build_config_clone
+        .package_loader(&package_path_clone, &env)
+        .load()
+        .await?;
+
     tokio::task::spawn_blocking(|| {
         sui_macros::nondeterministic!(compile_package_inner_blocking(
             package_path,
             build_config,
-            chain_id
+            chain_id,
+            root_pkg
         ))
     })
     .await?
@@ -103,79 +136,146 @@ fn compile_package_inner_blocking(
     package_path: PathBuf,
     build_config: MoveBuildConfig,
     chain_id: Option<String>,
-) -> Result<(CompiledPackage, MoveBuildConfig)> {
-    let build_config = resolve_lock_file_path(build_config, &package_path)?;
+    root_pkg: RootPackage<SuiFlavor>,
+) -> Result<(CompiledPackage, MoveBuildConfig, RootPackage<SuiFlavor>)> {
+    let mut stdout = std::io::stdout();
+    let package = move_package_alt_compilation::compile_from_root_package::<
+        std::io::Stdout,
+        SuiFlavor,
+    >(&root_pkg, &build_config, &mut stdout)
+    .expect("Compilation should succeed");
 
-    // Set the package ID to zero.
-    let previous_id = if let Some(ref chain_id) = chain_id {
-        sui_package_management::set_package_id(
-            &package_path,
-            build_config.install_dir.clone(),
-            chain_id,
-            AccountAddress::ZERO,
-        )?
-    } else {
-        None
-    };
+    let package_dependencies = PackageDependencies::new(&root_pkg)?;
+    tracing::info!(
+        "package path {:?}, chain_id {:?}, package_dependencies {:?}",
+        package_path,
+        chain_id,
+        package_dependencies
+    );
 
-    let run_bytecode_verifier = true;
-    let print_diags_to_stderr = false;
-    let config = BuildConfig {
-        config: build_config.clone(),
-        run_bytecode_verifier,
-        print_diags_to_stderr,
-        chain_id: chain_id.clone(),
-    };
-    let resolution_graph = config.resolution_graph(&package_path, chain_id.clone())?;
-    let (_, dependencies) = gather_published_ids(&resolution_graph, chain_id.clone());
-
-    // Check that the dependencies have a valid published address.
-    check_invalid_dependencies(&dependencies.invalid)?;
     // Check that all dependencies are published.
-    check_unpublished_dependencies(&dependencies.unpublished)?;
+    if !package_dependencies.unpublished.is_empty() {
+        bail!(
+            "Walrus packages must not have unpublished dependencies. Unpublished dependencies: {}
+        ",
+            package_dependencies
+                .unpublished
+                .into_iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
-    let compiled_package = build_from_resolution_graph(
-        resolution_graph,
-        run_bytecode_verifier,
-        print_diags_to_stderr,
-        chain_id.clone(),
-    )?;
+    let published_at = root_pkg
+        .publication()
+        .map(|p| ObjectID::from_address(p.addresses.published_at.0));
+
+    let compiled_package = CompiledPackage {
+        package,
+        published_at,
+        dependency_ids: package_dependencies,
+    };
 
     ensure!(
         compiled_package.published_root_module().is_none(),
         "package was already published, modules must all have 0x0 as their addresses."
     );
 
-    // Restore original ID.
-    if let (Some(chain_id), Some(previous_id)) = (chain_id, previous_id) {
-        let _ = sui_package_management::set_package_id(
-            &package_path,
-            build_config.install_dir.clone(),
-            &chain_id,
-            previous_id,
-        )?;
-    }
-
-    Ok((compiled_package, build_config))
+    Ok((compiled_package, build_config, root_pkg))
 }
 
+// TODO(WAL-1127): this is a complete copy of the function from
+// https://github.com/MystenLabs/sui/blob/a5ee2b9b736e712dfc917c5226ae1d835c59abd9/
+// crates/sui/src/client_commands.rs#L3548
+// Make that function in sui publicly accessible and use it here.
+/// Return the update publication data, without writing it to lockfile
+pub fn update_publication(
+    chain_id: &str,
+    command: LockCommand,
+    response: &ExecutedTransaction,
+    _build_config: &MoveBuildConfig,
+    publication: Option<&mut Publication<SuiFlavor>>,
+) -> Result<Publication<SuiFlavor>, anyhow::Error> {
+    // Get the published package ID and version from the response
+    let (published_id, version, _) = response.get_new_package_obj().ok_or_else(|| {
+        anyhow!(
+            "Expected a valid published package response but didn't see \
+        one when attempting to update the `Move.lock`."
+        )
+    })?;
+
+    match command {
+        LockCommand::Publish => {
+            let (upgrade_cap, _, _) = response
+                .get_new_package_upgrade_cap()
+                .ok_or_else(|| anyhow!("Expected a valid published package with a upgrade cap"))?;
+            Ok(Publication::<SuiFlavor> {
+                chain_id: chain_id.to_string(),
+                metadata: sui_package_alt::PublishedMetadata {
+                    toolchain_version: Some(env!("CARGO_PKG_VERSION").into()),
+                    build_config: Some(sui_package_alt::BuildParams::default()),
+                    upgrade_capability: Some(upgrade_cap),
+                },
+                addresses: PublishAddresses {
+                    published_at: PublishedID(*published_id),
+                    original_id: OriginalID(*published_id),
+                },
+                version: version.value(),
+            })
+        }
+        LockCommand::Upgrade => {
+            let publication =
+                publication.expect("for upgrade there should already exist publication info");
+            publication.addresses.published_at = PublishedID(*published_id);
+            publication.version = version.value();
+            // TODO: fix build config data
+            publication.metadata.build_config = Some(BuildParams::default());
+            publication.metadata.toolchain_version = Some(env!("CARGO_PKG_VERSION").into());
+            // TODO: fix this, we should return a mut publication instead of creating a new one in
+            // the Publish case
+            Ok(publication.clone())
+        }
+    }
+}
+
+// This function is used to publish walrus packages in a local environment such as integration
+// test or local testbed. This cannot be used in production environments.
+#[cfg(any(test, feature = "test-utils"))]
 #[tracing::instrument(err, skip(wallet, build_config))]
 pub(crate) async fn publish_package(
     wallet: &mut Wallet,
     package_path: PathBuf,
     build_config: MoveBuildConfig,
     gas_budget: Option<u64>,
-) -> Result<SuiTransactionBlockResponse> {
-    let sender = wallet.active_address()?;
+) -> Result<ExecutedTransaction> {
+    let sender = wallet.active_address();
     let retry_client = RetriableSuiClient::new(
-        vec![LazySuiClientBuilder::new(wallet.get_rpc_url()?, None)],
+        vec![LazySuiClientBuilder::new(wallet.get_rpc_url(), None)],
         Default::default(),
     )?;
 
-    let chain_id = retry_client.get_chain_identifier().await.ok();
+    let chain_id = retry_client.get_chain_identifier().await?;
 
-    let (compiled_package, build_config) =
-        compile_package(package_path, build_config, chain_id).await?;
+    // TODO(WAL-1126): this is a temporary workaround and should be removed once sui publish works
+    // with ephemeral publishing.
+    system_setup::add_localnet_env_to_contract_toml(package_path.clone(), chain_id.clone())?;
+
+    if cfg!(msim) {
+        // TODO(WAL-1125): before the new sui package management system introduced in 1.63 can
+        // support external dependencies, in simtest, we have to update all the implicit
+        // dependencies to sui using a local copy of the sui repository.
+        // The local copy should be pointed to by the SUI_REPO environment variable, and it should
+        // match the sui version used by the walrus. The pulling logic is implemented in the
+        // cargo-simtest script.
+        //
+        // Note that this must be done after the localnet environment is added to the Move.toml
+        // file.
+        system_setup::update_contract_sui_dependency_to_local_copy(package_path.clone())?;
+    }
+
+    let (compiled_package, final_build_config, mut root_package) =
+        compile_package(package_path, build_config, Some(chain_id.clone()), wallet).await?;
 
     let compiled_modules = compiled_package.get_package_bytes(false);
 
@@ -185,6 +285,7 @@ pub(crate) async fn publish_package(
     let transaction_kind = retry_client
         .get_current_client()
         .await
+        .sui_client()
         .transaction_builder()
         .publish_tx_kind(
             sender,
@@ -205,7 +306,13 @@ pub(crate) async fn publish_package(
         .await?;
 
     let gas_coins = retry_client
-        .select_coins(sender, None, u128::from(gas_budget), vec![])
+        .select_coins(
+            sender,
+            Coin::SUI,
+            u128::from(gas_budget),
+            vec![],
+            MAX_GAS_PAYMENT_OBJECTS,
+        )
         .await?
         .into_iter()
         .map(|coin| coin.object_ref())
@@ -225,20 +332,21 @@ pub(crate) async fn publish_package(
         .execute_transaction_may_fail(wallet.sign_transaction(&tx_data).await)
         .await?;
 
-    // Update the lock file with the new package ID.
-    wallet
-        .update_lock_file(
-            sui_package_management::LockCommand::Publish,
-            build_config.install_dir,
-            build_config.lock_file,
-            &response,
-        )
-        .await
-        .context("failed to update Move.lock")?;
+    // Write published data.
+    let publish_data = update_publication(
+        chain_id.as_str(),
+        LockCommand::Publish,
+        &response,
+        &final_build_config,
+        None,
+    )?;
+
+    root_package.write_publish_data(publish_data)?;
 
     Ok(response)
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) struct PublishSystemPackageResult {
     pub walrus_pkg_id: ObjectID,
     pub wal_exchange_pkg_id: Option<ObjectID>,
@@ -288,6 +396,7 @@ fn copy_recursively_inner_blocking(
 ///
 /// If `use_existing_wal_token` is set, skips the deployment of the `wal` package. This requires
 /// the package address to be set in the `wal/Move.lock` file for the current network.
+#[cfg(any(test, feature = "test-utils"))]
 #[tracing::instrument(err, skip(wallet))]
 pub(crate) async fn publish_coin_and_system_package(
     wallet: &mut Wallet,
@@ -302,7 +411,46 @@ pub(crate) async fn publish_coin_and_system_package(
     }: InitSystemParams,
     gas_budget: Option<u64>,
 ) -> Result<PublishSystemPackageResult> {
+    use sui_types::SUI_FRAMEWORK_ADDRESS;
+
+    use crate::contracts::StructTag;
+
+    const INIT_MODULE: &str = "init";
+    const INIT_CAP_TAG: StructTag<'_> = StructTag {
+        name: "InitCap",
+        module: INIT_MODULE,
+    };
+    const UPGRADE_CAP_TAG: StructTag<'_> = StructTag {
+        name: "UpgradeCap",
+        module: "package",
+    };
+
     let walrus_contract_directory = if let Some(deploy_directory) = deploy_directory {
+        // Clear the deploy directory before copying to avoid stale files
+        if deploy_directory.exists() {
+            // TODO(WAL-1126): remove this once sui publish works with ephemeral publishing.
+            // If the contract directory already exists and has been used for publishing, all the
+            // published info will be stored in the contract directory, which will make all the
+            // contracts appear as published. The root cause is that sui publish does not support
+            // ephemeral publishing yet.
+            //
+            // To make this work, we should clear the published info from the contract directory.
+            // This should not be needed if we can use ephemeral publishing.
+            tracing::warn!(
+                "clearing deploy directory {:?} before copying to it",
+                deploy_directory
+            );
+            // Clear all contents inside the directory without removing the directory itself
+            for entry in std::fs::read_dir(&deploy_directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    std::fs::remove_dir_all(path)?;
+                } else {
+                    std::fs::remove_file(path)?;
+                }
+            }
+        }
         copy_recursively(&contract_dir, &deploy_directory).await?;
         deploy_directory
     } else {
@@ -341,14 +489,14 @@ pub(crate) async fn publish_coin_and_system_package(
     .await?;
     let walrus_pkg_id = get_pkg_id_from_tx_response(&transaction_response)?;
 
-    let [init_cap_id] = get_created_sui_object_ids_by_type(
+    let [init_cap_id] = get_created_object_ids_by_type(
         &transaction_response,
         &INIT_CAP_TAG.to_move_struct_tag_with_package(walrus_pkg_id, &[])?,
     )?[..] else {
         bail!("unexpected number of InitCap objects created");
     };
 
-    let [upgrade_cap_id] = get_created_sui_object_ids_by_type(
+    let [upgrade_cap_id] = get_created_object_ids_by_type(
         &transaction_response,
         &UPGRADE_CAP_TAG.to_move_struct_tag_with_package(SUI_FRAMEWORK_ADDRESS.into(), &[])?,
     )?[..] else {
@@ -476,14 +624,14 @@ pub async fn create_system_and_staking_objects(
         ],
     );
 
-    pt_builder.transfer_arg(wallet.active_address()?, result);
+    pt_builder.transfer_arg(wallet.active_address(), result);
 
     // finalize transaction
     let ptb = pt_builder.finish();
-    let address = wallet.active_address()?;
+    let address = wallet.active_address();
 
     let retry_client = RetriableSuiClient::new(
-        vec![LazySuiClientBuilder::new(wallet.get_rpc_url()?, None)],
+        vec![LazySuiClientBuilder::new(wallet.get_rpc_url(), None)],
         Default::default(),
     )?;
 
@@ -499,7 +647,13 @@ pub async fn create_system_and_staking_objects(
         .await?;
 
     let gas_coins = retry_client
-        .select_coins(address, None, u128::from(gas_budget), vec![])
+        .select_coins(
+            address,
+            Coin::SUI,
+            u128::from(gas_budget),
+            vec![],
+            MAX_GAS_PAYMENT_OBJECTS,
+        )
         .await?
         .into_iter()
         .map(|coin| coin.object_ref())
@@ -515,30 +669,25 @@ pub async fn create_system_and_staking_objects(
         .execute_transaction_may_fail(signed_transaction)
         .await?;
 
-    if let SuiExecutionStatus::Failure { error } = response
-        .effects
-        .as_ref()
-        .ok_or_else(|| anyhow!("No transaction effects in response"))?
-        .status()
-    {
-        bail!("Error during execution: {}", error);
+    if let ExecutionStatus::Failure { error, command } = response.effects.status() {
+        bail!("Error during execution (command {command:?}): {error}");
     }
 
-    let [staking_object_id] = get_created_sui_object_ids_by_type(
+    let [staking_object_id] = get_created_object_ids_by_type(
         &response,
         &contracts::staking::Staking.to_move_struct_tag_with_package(contract_pkg_id, &[])?,
     )?[..] else {
         bail!("unexpected number of staking objects created");
     };
 
-    let [system_object_id] = get_created_sui_object_ids_by_type(
+    let [system_object_id] = get_created_object_ids_by_type(
         &response,
         &contracts::system::System.to_move_struct_tag_with_package(contract_pkg_id, &[])?,
     )?[..] else {
         bail!("unexpected number of system objects created");
     };
 
-    let [upgrade_manager_object_id] = get_created_sui_object_ids_by_type(
+    let [upgrade_manager_object_id] = get_created_object_ids_by_type(
         &response,
         &contracts::upgrade::UpgradeManager
             .to_move_struct_tag_with_package(contract_pkg_id, &[])?,

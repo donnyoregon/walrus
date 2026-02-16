@@ -1,4 +1,4 @@
-FROM rust:1.92-bookworm as builder
+FROM rust:1.93-bookworm as builder
 
 ARG PROFILE=release
 WORKDIR /work
@@ -9,6 +9,7 @@ COPY .git/ .git/
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 COPY contracts contracts
+COPY setup setup
 
 RUN cargo build --profile ${PROFILE} --bin walrus-proxy
 

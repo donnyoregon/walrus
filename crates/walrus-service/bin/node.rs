@@ -64,8 +64,6 @@ use walrus_sui::{
     types::move_structs::VotingParams,
     utils::SuiNetwork,
 };
-use walrus_utils::config::Config as _;
-
 // Define the `GIT_REVISION` and `VERSION` consts
 walrus_utils::bin_version!();
 
@@ -505,8 +503,7 @@ fn main() -> anyhow::Result<()> {
             cleanup_storage,
             ignore_sync_failures: _,
         } => loop {
-            tracing::info!("loading node configuration from {}", config_path.display());
-            let config = StorageNodeConfig::load_and_validate(&config_path)?;
+            let config = StorageNodeConfig::load_config(&config_path)?;
             let result = commands::run(
                 config,
                 cleanup_storage,
@@ -595,7 +592,10 @@ mod commands {
             config::{EventProcessorConfig, EventProcessorRuntimeConfig, SystemConfig},
             processor::EventProcessor,
         },
-        node::{DatabaseConfig, config::TlsConfig},
+        node::{
+            DatabaseConfig,
+            config::{LoadedConfig, TlsConfig},
+        },
         utils,
     };
     use walrus_sui::{
@@ -613,10 +613,11 @@ mod commands {
     use super::*;
 
     pub(super) fn run(
-        mut config: StorageNodeConfig,
+        loaded_config: LoadedConfig,
         cleanup_storage: bool,
         config_loader: Arc<dyn ConfigLoader>,
     ) -> anyhow::Result<()> {
+        let mut config = loaded_config.config;
         if cleanup_storage {
             let storage_path = &config.storage_path;
 
@@ -647,7 +648,14 @@ mod commands {
                     .expect("metrics defined at compile time must be valid");
             });
 
-        tracing::info!(version = VERSION, "Walrus binary version");
+        // Log the basic information about the node. Note that anything logged before the logging
+        // runtime starts will not be seen by the runtime.
+        tracing::info!(
+            version = VERSION,
+            network_kind = ?loaded_config.network_kind,
+            config_path = ?loaded_config.config_path,
+            "Walrus node configuration",
+        );
         config.load_keys()?;
         tracing::info!(
             walrus.node.public_key = %config.protocol_key_pair().public(),
@@ -669,7 +677,7 @@ mod commands {
                 &config.contract_config.system_object,
                 &config.contract_config.staking_object,
                 WalletConfig::load_wallet(Some(&config.wallet_config), config.request_timeout)
-                    .and_then(|mut wallet| wallet.active_address())
+                    .map(|wallet| wallet.active_address())
                     .ok(),
             );
         }
@@ -872,7 +880,7 @@ mod commands {
     /// the new config file may not contain it after adding the storage node capability object ID.
     #[tokio::main]
     pub(crate) async fn register_node(config_path: PathBuf, force: bool) -> anyhow::Result<()> {
-        let mut config: StorageNodeConfig = StorageNodeConfig::load_and_validate(&config_path)?;
+        let mut config = StorageNodeConfig::load_config(&config_path)?.config;
         let contract_client = get_contract_client_from_node_config(&config).await?;
 
         if !force
@@ -965,10 +973,7 @@ mod commands {
             );
             let wallet = load_wallet_context_from_path(Some(&wallet_config), None)
                 .context("Reading Sui wallet failed")?;
-            wallet
-                .get_rpc_url()
-                .context("Unable to get the wallet's active environment")?
-                .clone()
+            wallet.get_rpc_url().to_string()
         };
 
         // Do a minor sanity check that the user has not included a port in the hostname.

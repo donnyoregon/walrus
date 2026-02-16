@@ -226,6 +226,9 @@ walrus_utils::metrics::define_metric_set! {
         #[help = "The number of blobs registered to be notified when the blob expires/gets \
         deleted/gets invalidated"]
         blob_retirement_notifier_registered_blobs: IntGauge[],
+
+        #[help = "The current monitored WAL price in USD"]
+        current_monitored_wal_price: GaugeVec["source"],
     }
 }
 
@@ -358,6 +361,7 @@ impl TelemetryLabel for ProtocolEvent {
     fn label(&self) -> &'static str {
         match self {
             ProtocolEvent::ProtocolVersionUpdated(_) => "protocol-version-updated",
+            ProtocolEvent::PricesUpdated(_) => "prices-updated",
         }
     }
 }
@@ -422,6 +426,7 @@ impl TelemetryLabel for ClientErrorKind {
             ClientErrorKind::ByteRangeReadError(_) => "byte-range-read-error",
             ClientErrorKind::ClientInitializationError(_) => "client-initialization-error",
             ClientErrorKind::ByteRangeReadInputError(_) => "byte-range-read-input-error",
+            ClientErrorKind::ReconstructSliverError(_) => "reconstruct-sliver-error",
         }
     }
 }

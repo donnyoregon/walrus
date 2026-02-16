@@ -3,19 +3,20 @@
 
 //! Infrastructure for retrying RPC calls with backoff, in case there are network errors.
 //!
-//! Wraps the [`SuiClient`] to introduce retries.
+//! Wraps the [`DualClient`] to introduce retries.
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap, HashMap},
-    fmt,
-    pin::pin,
+    collections::{BTreeMap, BinaryHeap, HashMap, VecDeque},
+    pin::Pin,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
 use anyhow::Context;
-use futures::{Stream, StreamExt, future, stream};
+use bytes::Bytes;
+use futures::{Stream, StreamExt, stream};
+use move_core_types::language_storage::StructTag;
 use rand::{
     Rng as _,
     RngCore,
@@ -23,20 +24,20 @@ use rand::{
     rngs::{StdRng, ThreadRng},
 };
 use serde::{Serialize, de::DeserializeOwned};
+use sui_rpc::proto::sui::rpc::v2::Bcs;
 use sui_sdk::{
-    SuiClient,
-    SuiClientBuilder,
     error::Error as SuiSdkError,
     rpc_types::{
-        Balance,
-        Coin,
         DryRunTransactionBlockResponse,
+        DynamicFieldInfo,
         ObjectsPage,
+        Page,
         SuiCommittee,
         SuiEvent,
         SuiMoveNormalizedModule,
         SuiMoveNormalizedStructType,
         SuiMoveNormalizedType,
+        SuiObjectData,
         SuiObjectDataOptions,
         SuiObjectResponse,
         SuiObjectResponseQuery,
@@ -52,13 +53,13 @@ use sui_sdk::{
 use sui_types::transaction::TransactionDataAPI;
 use sui_types::{
     TypeTag,
-    base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress, TransactionDigest},
+    base_types::{ObjectID, ObjectRef, ObjectType, SequenceNumber, SuiAddress, TransactionDigest},
     dynamic_field::derive_dynamic_field_id,
     event::EventID,
     object::Owner,
-    quorum_driver_types::ExecuteTransactionRequestType::WaitForLocalExecution,
     sui_serde::BigInt,
     transaction::{Transaction, TransactionData, TransactionKind},
+    transaction_driver_types::ExecuteTransactionRequestType::WaitForLocalExecution,
 };
 use tracing::Level;
 use walrus_core::ensure;
@@ -74,21 +75,27 @@ use super::{
     retry_rpc_errors,
 };
 use crate::{
-    client::SuiClientMetricSet,
-    contracts::{self, AssociatedContractStruct, TypeOriginMap},
+    balance::Balance,
+    client::{
+        SuiClientMetricSet,
+        dual_client::{BcsDatapack, CoinBatch, DualClient},
+    },
+    coin::Coin,
+    contracts::{self, AssociatedContractStruct, MoveConversionError, TypeOriginMap},
     types::{
         BlobEvent,
         move_structs::{
             BlobAttribute,
             Credits,
             Key,
+            StakingObjectForDeserialization,
             StakingPool,
             StorageNode,
             SuiDynamicField,
             SystemObjectForDeserialization,
         },
     },
-    utils::get_sui_object_from_object_response,
+    utils::{get_sui_object_from_bcs, get_sui_object_from_object_response},
 };
 
 /// The maximum gas allowed in a transaction, in MIST (50 SUI). Used for gas budget estimation.
@@ -99,7 +106,7 @@ const DUMMY_GAS_PRICE: u64 = 1000;
 /// The maximum number of gas payment objects allowed in a transaction by the Sui protocol
 /// configuration
 /// [here](https://github.com/MystenLabs/sui/blob/main/crates/sui-protocol-config/src/lib.rs#L2089).
-pub(crate) const MAX_GAS_PAYMENT_OBJECTS: usize = 256;
+pub const MAX_GAS_PAYMENT_OBJECTS: usize = 256;
 
 /// Default backoff delays used when building a `SuiClient`.
 const CLIENT_BUILD_RETRY_MIN_DELAY: Duration = Duration::from_secs(1);
@@ -107,59 +114,32 @@ const CLIENT_BUILD_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 /// The maximum number of retries for building a SuiClient.
 const RPC_MAX_TRIES: u32 = 3;
 
-/// [`LazySuiClientBuilder`] has enough information to create a [`SuiClient`], when its
+/// [`LazySuiClientBuilder`] has enough information to create a [`DualClient`], when its
 /// [`LazyClientBuilder`] trait implementation is used.
-#[derive(Clone)]
-pub enum LazySuiClientBuilder {
-    /// A client that is built dynamically from a URL.
-    Url {
-        /// The URL of the RPC server.
-        rpc_url: String,
-        /// Override the default timeout for any requests.
-        request_timeout: Option<Duration>,
-    },
-    /// Use a pre-existing client.
-    Client(Arc<SuiClient>),
-}
-
-impl fmt::Debug for LazySuiClientBuilder {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Url {
-                rpc_url,
-                request_timeout,
-            } => f
-                .debug_tuple("Url")
-                .field(rpc_url)
-                .field(request_timeout)
-                .finish(),
-            Self::Client(_) => f.debug_tuple("Client").finish(),
-        }
-    }
-}
-
-impl From<SuiClient> for LazySuiClientBuilder {
-    fn from(client: SuiClient) -> Self {
-        Self::Client(Arc::new(client))
-    }
+#[derive(Debug, Clone)]
+pub struct LazySuiClientBuilder {
+    /// The URL of the RPC server.
+    rpc_url: String,
+    /// Override the default timeout for any requests.
+    request_timeout: Option<Duration>,
 }
 
 impl LazySuiClientBuilder {
     /// Creates a new [`LazySuiClientBuilder`] from a URL and an optional `request_timeout`.
     pub fn new(rpc_url: impl AsRef<str>, request_timeout: Option<Duration>) -> Self {
-        Self::Url {
+        Self {
             rpc_url: rpc_url.as_ref().to_string(),
             request_timeout,
         }
     }
 }
 
-impl LazyClientBuilder<SuiClient> for LazySuiClientBuilder {
+impl LazyClientBuilder<DualClient> for LazySuiClientBuilder {
     // TODO: WAL-796 Out of concern for consistency, we are disabling the failover mechanism for
     // SuiClient for now.
     const DEFAULT_MAX_TRIES: usize = 5;
 
-    async fn lazy_build_client(&self) -> Result<Arc<SuiClient>, FailoverError> {
+    async fn lazy_build_client(&self) -> Result<Arc<DualClient>, FailoverError> {
         // Inject sui client build failure for simtests.
         #[cfg(msim)]
         {
@@ -167,13 +147,8 @@ impl LazyClientBuilder<SuiClient> for LazySuiClientBuilder {
             sui_macros::fail_point_arg!(
                 "failpoint_sui_client_build_client",
                 |url_to_fail: String| {
-                    match self {
-                        Self::Url { rpc_url, .. } => {
-                            if *rpc_url == url_to_fail {
-                                fail_client_creation = true;
-                            }
-                        }
-                        Self::Client(_) => {}
+                    if self.rpc_url == url_to_fail {
+                        fail_client_creation = true;
                     }
                 }
             );
@@ -187,48 +162,31 @@ impl LazyClientBuilder<SuiClient> for LazySuiClientBuilder {
             }
         }
 
-        match self {
-            Self::Client(client) => Ok(client.clone()),
-            Self::Url {
-                rpc_url,
-                request_timeout,
-            } => {
-                let sui_client = retry_rpc_errors(
-                    ExponentialBackoffConfig::new(
-                        CLIENT_BUILD_RETRY_MIN_DELAY,
-                        CLIENT_BUILD_RETRY_MAX_DELAY,
-                        Some(RPC_MAX_TRIES),
-                    )
-                    .get_strategy(StdRng::from_entropy().next_u64()),
-                    || async {
-                        let mut client_builder = SuiClientBuilder::default();
-                        if let Some(request_timeout) = request_timeout {
-                            client_builder = client_builder.request_timeout(*request_timeout);
-                        }
-                        client_builder.build(rpc_url).await
-                    },
-                    None,
-                    "build_sui_client",
-                )
-                .await
-                .map_err(|e| {
-                    tracing::info!(
-                        "failed to get sui client from url {}, error: {}",
-                        rpc_url,
-                        e
-                    );
-                    FailoverError::FailedToGetClient(e.to_string())
-                })?;
-                Ok(Arc::new(sui_client))
-            }
-        }
+        let dual_client = retry_rpc_errors(
+            ExponentialBackoffConfig::new(
+                CLIENT_BUILD_RETRY_MIN_DELAY,
+                CLIENT_BUILD_RETRY_MAX_DELAY,
+                Some(RPC_MAX_TRIES),
+            )
+            .get_strategy(StdRng::from_entropy().next_u64()),
+            || async { DualClient::new(self.rpc_url.as_str(), self.request_timeout).await },
+            None,
+            "build_sui_client",
+        )
+        .await
+        .map_err(|e| {
+            tracing::info!(
+                "failed to get sui client from url {}, error: {}",
+                self.rpc_url,
+                e
+            );
+            FailoverError::FailedToGetClient(e.to_string())
+        })?;
+        Ok(Arc::new(dual_client))
     }
 
-    fn get_rpc_url(&self) -> Option<&str> {
-        match self {
-            Self::Url { rpc_url, .. } => Some(rpc_url.as_str()),
-            Self::Client(_) => None,
-        }
+    fn get_rpc_url(&self) -> &str {
+        self.rpc_url.as_str()
     }
 }
 
@@ -241,16 +199,74 @@ pub struct GasBudgetAndPrice {
     pub gas_price: u64,
 }
 
-/// A [`SuiClient`] that retries RPC calls with backoff in case of network errors.
+/// gRPC Client Migration levels.
+///
+/// Note that values in this enum are cumulative, so higher levels include all the migrations of the
+/// lower levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd)]
+pub struct GrpcMigrationLevel(u32);
+
+const GRPC_MIGRATION_LEVEL_LEGACY_U32: u32 = 0;
+const GRPC_MIGRATION_LEVEL_GET_OBJECT: GrpcMigrationLevel = GrpcMigrationLevel(1);
+const GRPC_MIGRATION_LEVEL_BATCH_OBJECTS: GrpcMigrationLevel = GrpcMigrationLevel(2);
+const GRPC_MIGRATION_LEVEL_SELECT_COINS: GrpcMigrationLevel = GrpcMigrationLevel(3);
+const GRPC_MIGRATION_LEVEL_GET_BALANCE: GrpcMigrationLevel = GrpcMigrationLevel(4);
+
+impl Default for GrpcMigrationLevel {
+    fn default() -> Self {
+        static VALUE: LazyLock<u32> = LazyLock::new(|| {
+            std::env::var("WALRUS_GRPC_MIGRATION_LEVEL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(GRPC_MIGRATION_LEVEL_LEGACY_U32)
+        });
+        Self(*VALUE)
+    }
+}
+
+pub(crate) fn get_initial_version_from_object_response(
+    object_response: &SuiObjectResponse,
+) -> SuiClientResult<SequenceNumber> {
+    if let Some(Owner::Shared {
+        initial_shared_version,
+    }) = object_response.owner()
+    {
+        Ok(initial_shared_version)
+    } else {
+        Err(SuiClientError::Internal(anyhow::anyhow!(
+            "trying to get the initial version of a non-shared object; object_id: {:?}",
+            object_response.object_id(),
+        )))
+    }
+}
+
+pub(crate) fn get_initial_version_from_grpc_object(
+    object: &sui_types::object::Object,
+) -> SuiClientResult<SequenceNumber> {
+    if let Owner::Shared {
+        initial_shared_version,
+    } = object.owner()
+    {
+        Ok(*initial_shared_version)
+    } else {
+        Err(SuiClientError::Internal(anyhow::anyhow!(
+            "trying to get the initial version of a non-shared object; object_id: {:?}",
+            object.id(),
+        )))
+    }
+}
+
+/// A [`DualClient`] that retries RPC calls with backoff in case of network errors.
 ///
 /// This retriable client wraps functions from the [`CoinReadApi`][sui_sdk::apis::CoinReadApi] and
-/// the [`ReadApi`][sui_sdk::apis::ReadApi] of the [`SuiClient`], and
+/// the [`ReadApi`][sui_sdk::apis::ReadApi] of the [`DualClient`], and
 /// additionally provides some convenience methods.
 #[derive(Clone, Debug)]
 pub struct RetriableSuiClient {
-    failover_sui_client: FailoverWrapper<SuiClient, LazySuiClientBuilder>,
+    failover_sui_client: FailoverWrapper<DualClient, LazySuiClientBuilder>,
     backoff_config: ExponentialBackoffConfig,
     metrics: Option<Arc<SuiClientMetricSet>>,
+    grpc_migration_level: GrpcMigrationLevel,
 }
 
 impl RetriableSuiClient {
@@ -263,6 +279,7 @@ impl RetriableSuiClient {
             failover_sui_client: FailoverWrapper::new(lazy_client_builders)
                 .context("creating failover wrapper")?,
             backoff_config,
+            grpc_migration_level: GrpcMigrationLevel::default(),
             metrics: None,
         })
     }
@@ -291,36 +308,123 @@ impl RetriableSuiClient {
         Ok(Self::new(failover_clients, backoff_config)?)
     }
 
+    /// Fetches both the system object and the staking object.
+    pub async fn fetch_system_and_staking_objects(
+        &self,
+        system_object_id: ObjectID,
+        staking_object_id: ObjectID,
+    ) -> SuiClientResult<(
+        SystemObjectForDeserialization,
+        SequenceNumber,
+        StakingObjectForDeserialization,
+        SequenceNumber,
+    )> {
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_BATCH_OBJECTS {
+            let objects_bcs_datapacks = self
+                .multi_get_objects_bcs_datapacks(&[system_object_id, staking_object_id])
+                .await?;
+            let [system_object_bcs_datapack, staking_object_bcs_datapack] =
+                objects_bcs_datapacks.as_slice()
+            else {
+                return Err(SuiClientError::Internal(anyhow::anyhow!(
+                    "received an unexpected response when getting the system and staking objects",
+                )));
+            };
+            Ok((
+                get_sui_object_from_bcs(
+                    system_object_bcs_datapack.bcs.value(),
+                    &system_object_bcs_datapack.struct_tag,
+                )?,
+                system_object_bcs_datapack
+                    .initial_shared_version
+                    .context("system object has missing owner_version")?
+                    .into(),
+                get_sui_object_from_bcs(
+                    staking_object_bcs_datapack.bcs.value(),
+                    &staking_object_bcs_datapack.struct_tag,
+                )?,
+                staking_object_bcs_datapack
+                    .initial_shared_version
+                    .context("staking object has missing owner_version")?
+                    .into(),
+            ))
+        } else {
+            let object_responses = self
+                .multi_get_object_with_options(
+                    &[system_object_id, staking_object_id],
+                    SuiObjectDataOptions::new()
+                        .with_owner()
+                        .with_bcs()
+                        .with_type(),
+                )
+                .await?;
+            let [system_object_response, staking_object_response] = object_responses.as_slice()
+            else {
+                return Err(SuiClientError::Internal(anyhow::anyhow!(
+                    "received an unexpected response when getting the system and staking objects",
+                )));
+            };
+
+            let system_object_for_deserialization: SystemObjectForDeserialization =
+                get_sui_object_from_object_response(system_object_response)?;
+            let system_object_initial_version =
+                get_initial_version_from_object_response(system_object_response)?;
+            let staking_object_for_deserialization: StakingObjectForDeserialization =
+                get_sui_object_from_object_response(staking_object_response)?;
+            let staking_object_initial_version =
+                get_initial_version_from_object_response(staking_object_response)?;
+            Ok((
+                system_object_for_deserialization,
+                system_object_initial_version,
+                staking_object_for_deserialization,
+                staking_object_initial_version,
+            ))
+        }
+    }
     // Re-implementation of the `SuiClient` methods.
 
-    /// Return a list of coins for the given address, or an error upon failure.
-    ///
-    /// Reimplements the functionality of [`sui_sdk::apis::CoinReadApi::select_coins`] with the
-    /// addition of retries on network errors.
+    /// Returns a list of coins for the given address, or an error upon failure. This method always
+    /// filters on coin types. When `coin_type` is `None`, it will filter for SUI. Otherwise, it
+    /// will filter to the given coin type. It will attempt to gather coins to satisfy the given
+    /// `amount`. `exclude` is a list of coin object IDs to exclude from the result. `max_num_coins`
+    /// puts a hard cap on the number of coins returned.
     #[tracing::instrument(skip(self, address, exclude), level = Level::DEBUG)]
     pub async fn select_coins(
         &self,
         address: SuiAddress,
-        coin_type: Option<String>,
+        coin_type: &str,
         amount: u128,
         exclude: Vec<ObjectID>,
+        max_num_coins: usize,
     ) -> SuiClientResult<Vec<Coin>> {
         retry_rpc_errors(
             self.get_strategy(),
             || async {
-                self.select_coins_with_limit(
+                self.select_coins_with_filter(
                     address,
-                    coin_type.clone(),
+                    coin_type,
                     amount,
                     exclude.clone(),
-                    MAX_GAS_PAYMENT_OBJECTS,
+                    max_num_coins,
                 )
                 .await
             },
             self.metrics.clone(),
-            "select_coins",
+            "select_coins_with_filter",
         )
         .await
+    }
+
+    fn get_coins_stream_retry(
+        &self,
+        owner: SuiAddress,
+        coin_type: &str,
+    ) -> Pin<Box<dyn Stream<Item = Coin> + Send + '_>> {
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_SELECT_COINS {
+            self.get_coins_stream_retry_with_grpc(owner, coin_type)
+        } else {
+            self.get_coins_stream_retry_with_json_rpc(owner, coin_type)
+        }
     }
 
     /// Returns a list of all coins for the given address, with a filter on the coin type. Note
@@ -328,41 +432,36 @@ impl RetriableSuiClient {
     pub async fn select_all_coins(
         &self,
         address: SuiAddress,
-        coin_type: Option<String>,
+        coin_type: &str,
     ) -> SuiClientResult<Vec<Coin>> {
-        let mut coins_stream = pin!(self.get_coins_stream_retry(address, coin_type.clone()));
+        let mut coins_stream = self.get_coins_stream_retry(address, coin_type);
 
         let mut selected_coins = Vec::new();
-        while let Some(coin) = coins_stream.as_mut().next().await {
+        while let Some(coin) = coins_stream.next().await {
             selected_coins.push(coin);
         }
         Ok(selected_coins)
     }
 
-    /// Returns a list of coins for the given address, or an error upon failure. This method always
-    /// filters on coin types. When `coin_type` is `None`, it will filter for SUI. Otherwise, it
-    /// will filter to the given coin type. It will attempt to gather coins to satisfy the given
-    /// `amount`. `exclude` is a list of coin object IDs to exclude from the result.
-    /// `max_num_coins` puts a hard cap on the number of coins returned.
-    pub async fn select_coins_with_limit(
+    async fn select_coins_with_filter(
         &self,
         address: SuiAddress,
-        coin_type: Option<String>,
+        coin_type: &str,
         amount: u128,
         exclude: Vec<ObjectID>,
         max_num_coins: usize,
     ) -> SuiClientResult<Vec<Coin>> {
-        let mut coins_stream = pin!(
-            self.get_coins_stream_retry(address, coin_type.clone())
-                .filter(|coin: &Coin| future::ready(!exclude.contains(&coin.coin_object_id)))
-        );
+        let mut coins_stream = self.get_coins_stream_retry(address, coin_type);
 
         let mut selected_coins: BinaryHeap<Reverse<OrderedCoin>> = BinaryHeap::new();
 
         let mut total_selected = 0u128;
         let mut total_available = 0u128;
 
-        while let Some(coin) = coins_stream.as_mut().next().await {
+        while let Some(coin) = coins_stream.next().await {
+            if exclude.contains(&coin.coin_object_id) {
+                continue;
+            }
             let coin_balance = u128::from(coin.balance);
             total_available += coin_balance;
             if selected_coins.len() >= max_num_coins {
@@ -395,22 +494,163 @@ impl RetriableSuiClient {
         } else {
             // We ran out of coins and cannot get to `amount` with `max_num_coins`.
             Err(SuiClientError::InsufficientFundsWithMaxCoins(
-                coin_type.unwrap_or_else(|| sui_sdk::SUI_COIN_TYPE.to_string()),
+                coin_type.to_owned(),
             ))
         }
+    }
+
+    /// Returns a vector of owned object.
+    pub async fn get_owned_objects_of_type<U>(
+        &self,
+        owner: SuiAddress,
+        type_origin_map: &TypeOriginMap,
+        type_args: &[TypeTag],
+    ) -> SuiClientResult<Vec<(U, ObjectRef)>>
+    where
+        U: AssociatedContractStruct,
+    {
+        let object_type = U::CONTRACT_STRUCT
+            .to_move_struct_tag_with_type_map(type_origin_map, type_args)?
+            .to_string();
+        let mut result_objects_with_refs = Vec::new();
+
+        // Figure out the next page to ask for.
+        let mut next_page_token = None;
+
+        loop {
+            // Fetch a batch of coins.
+            let object_batch = self
+                .failover_sui_client
+                .with_failover(
+                    async |client, method| {
+                        retry_rpc_errors(
+                            self.get_strategy(),
+                            || async {
+                                client
+                                    .fetch_batch_of_objects(
+                                        owner,
+                                        &object_type,
+                                        next_page_token.clone(),
+                                    )
+                                    .await
+                            },
+                            self.metrics.clone(),
+                            method,
+                        )
+                        .await
+                        .inspect_err(|error| {
+                            tracing::warn!(%error,
+                                    "failed to get objects via grpc after retries");
+                        })
+                    },
+                    None,
+                    "fetch_batch_of_objects",
+                )
+                .await?;
+
+            // Collect our new objects, and advance the cursor.
+            result_objects_with_refs.extend(object_batch.objects_with_refs);
+            next_page_token = object_batch.next_page_token;
+            if next_page_token.is_none() {
+                break;
+            }
+        }
+        Ok(result_objects_with_refs)
+    }
+
+    /// Returns a stream of coins for the given address.
+    fn get_coins_stream_retry_with_grpc(
+        &self,
+        owner: SuiAddress,
+        coin_type: &str,
+    ) -> Pin<Box<dyn Stream<Item = Coin> + Send + '_>> {
+        let stream_state = StreamState::<Coin>::new_with_coin_type(owner, coin_type);
+
+        Box::pin(stream::unfold(
+            stream_state,
+            move |mut stream_state| async move {
+                // If we've got a coin from a prior batch, let's stream it.
+                if let Some((coin, _)) = stream_state.queue.pop_front() {
+                    return Some((coin, stream_state));
+                }
+
+                // Figure out the next page to ask for.
+                let next_page_token = {
+                    let mut cursor = Cursor::Done;
+                    std::mem::swap(&mut cursor, &mut stream_state.cursor);
+                    match cursor {
+                        Cursor::Init => None,
+                        Cursor::NextToken(next_page_token) => Some(next_page_token),
+                        Cursor::Done => {
+                            return None;
+                        }
+                    }
+                };
+
+                // Fetch a batch of coins.
+                let CoinBatch {
+                    coins,
+                    next_page_token,
+                } = self
+                    .failover_sui_client
+                    .with_failover(
+                        async |client, method| {
+                            retry_rpc_errors(
+                                self.get_strategy(),
+                                || async {
+                                    client
+                                        .fetch_batch_of_coins(
+                                            stream_state.owner,
+                                            &stream_state.object_type,
+                                            next_page_token.clone(),
+                                        )
+                                        .await
+                                },
+                                self.metrics.clone(),
+                                method,
+                            )
+                            .await
+                            .inspect_err(|error| {
+                                tracing::warn!(%error,
+                                    "failed to get coins via grpc after retries");
+                            })
+                        },
+                        None,
+                        "fetch_batch_of_coins",
+                    )
+                    .await
+                    .ok()?;
+
+                // Collect our new coins, and advance the cursor.
+                stream_state.queue.extend(coins.into_iter().map(|coin| {
+                    let object_ref = coin.object_ref();
+                    (coin, object_ref)
+                }));
+                if let Some(next_page_token) = next_page_token {
+                    stream_state.cursor = Cursor::NextToken(next_page_token);
+                } else {
+                    stream_state.cursor = Cursor::Done;
+                }
+                stream_state
+                    .queue
+                    .pop_front()
+                    .map(|(coin, _)| (coin, stream_state))
+            },
+        ))
     }
 
     /// Returns a stream of coins for the given address.
     ///
     /// This is a re-implementation of the [`sui_sdk::apis::CoinReadApi::get_coins_stream`] method
-    /// in the [`SuiClient`] struct. Unlike the original implementation, this version will retry
-    /// failed RPC calls.
-    fn get_coins_stream_retry(
+    /// in the [`sui_sdk::SuiClient`] struct. Unlike the original implementation, this version will
+    /// retry failed RPC calls.
+    fn get_coins_stream_retry_with_json_rpc(
         &self,
         owner: SuiAddress,
-        coin_type: Option<String>,
-    ) -> impl Stream<Item = Coin> + '_ {
-        stream::unfold(
+        coin_type: &str,
+    ) -> Pin<Box<dyn Stream<Item = Coin> + Send + '_>> {
+        let coin_type = coin_type.to_string();
+        Box::pin(stream::unfold(
             (
                 vec![],
                 /* cursor */ None,
@@ -419,7 +659,7 @@ impl RetriableSuiClient {
             ),
             move |(mut data, cursor, has_next_page, coin_type)| async move {
                 if let Some(item) = data.pop() {
-                    Some((item, (data, cursor, has_next_page, coin_type)))
+                    Some((Coin::from(item), (data, cursor, has_next_page, coin_type)))
                 } else if has_next_page {
                     let page = self
                         .failover_sui_client
@@ -429,10 +669,11 @@ impl RetriableSuiClient {
                                     self.get_strategy(),
                                     || async {
                                         client
+                                            .sui_client()
                                             .coin_read_api()
                                             .get_coins(
                                                 owner,
-                                                coin_type.clone(),
+                                                Some(coin_type.clone()),
                                                 cursor.clone(),
                                                 Some(100),
                                             )
@@ -458,7 +699,7 @@ impl RetriableSuiClient {
                     data.reverse();
                     data.pop().map(|item| {
                         (
-                            item,
+                            Coin::from(item),
                             (data, page.next_cursor, page.has_next_page, coin_type),
                         )
                     })
@@ -466,33 +707,99 @@ impl RetriableSuiClient {
                     None
                 }
             },
-        )
+        ))
     }
 
-    /// Returns the balance for the given coin type owned by address.
-    ///
-    /// Calls [`sui_sdk::apis::CoinReadApi::get_balance`] internally.
-    #[tracing::instrument(level = Level::TRACE, skip_all)]
+    /// Returns a [`Balance`] for the given coin type owned by address. This has a bit more
+    /// information than just the total balance. Not all callsites need this extra information.
     pub async fn get_balance(
         &self,
         owner: SuiAddress,
-        coin_type: Option<String>,
+        coin_type: &str,
+    ) -> SuiClientResult<Balance> {
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_BALANCE {
+            self.get_balance_with_grpc(owner, coin_type).await
+        } else {
+            self.get_balance_with_json_rpc(owner, coin_type).await
+        }
+    }
+
+    /// Returns the total balance for the given coin type owned by address.
+    pub async fn get_total_balance(
+        &self,
+        owner: SuiAddress,
+        coin_type: &str,
+    ) -> SuiClientResult<u64> {
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_BALANCE {
+            self.get_total_balance_with_grpc(owner, coin_type).await
+        } else {
+            Ok(self
+                .get_balance_with_json_rpc(owner, coin_type)
+                .await?
+                .total_balance())
+        }
+    }
+
+    #[tracing::instrument(level = Level::TRACE, skip_all)]
+    async fn get_total_balance_with_grpc(
+        &self,
+        owner: SuiAddress,
+        coin_type: &str,
+    ) -> SuiClientResult<u64> {
+        self.failover_sui_client
+            .with_failover(
+                async |client, method| {
+                    retry_rpc_errors(
+                        self.get_strategy(),
+                        || async { client.get_total_balance(owner, coin_type).await },
+                        self.metrics.clone(),
+                        method,
+                    )
+                    .await
+                },
+                None,
+                "get_balance",
+            )
+            .await
+    }
+
+    #[tracing::instrument(level = Level::TRACE, skip_all)]
+    async fn get_balance_with_grpc(
+        &self,
+        owner: SuiAddress,
+        coin_type: &str,
+    ) -> SuiClientResult<Balance> {
+        let coins = self
+            .select_all_coins(owner, coin_type)
+            .await
+            .context("selecting all coins for balance")?;
+        Ok(Balance::try_from_coins(coins).context("get_balance_with_grpc")?)
+    }
+
+    #[tracing::instrument(level = Level::TRACE, skip_all)]
+    async fn get_balance_with_json_rpc(
+        &self,
+        owner: SuiAddress,
+        coin_type: &str,
     ) -> SuiClientResult<Balance> {
         self.failover_sui_client
             .with_failover(
                 async |client, method| {
-                    Ok(retry_rpc_errors(
+                    retry_rpc_errors(
                         self.get_strategy(),
                         || async {
                             client
+                                .sui_client()
                                 .coin_read_api()
-                                .get_balance(owner, coin_type.clone())
+                                .get_balance(owner, Some(coin_type.to_owned()))
                                 .await
+                                .map_err(|error| error.into())
+                                .and_then(|balance| Ok(Balance::try_from(balance)?))
                         },
                         self.metrics.clone(),
                         method,
                     )
-                    .await?)
+                    .await
                 },
                 None,
                 "get_balance",
@@ -513,18 +820,19 @@ impl RetriableSuiClient {
         descending_order: bool,
     ) -> SuiClientResult<TransactionBlocksPage> {
         async fn make_request(
-            client: Arc<SuiClient>,
+            client: Arc<DualClient>,
             query: SuiTransactionBlockResponseQuery,
             cursor: Option<TransactionDigest>,
             limit: Option<usize>,
             descending_order: bool,
         ) -> SuiClientResult<TransactionBlocksPage> {
             Ok(client
+                .sui_client()
                 .read_api()
                 .query_transaction_blocks(query.clone(), cursor, limit, descending_order)
                 .await?)
         }
-        let request = |client: Arc<SuiClient>, method: &'static str| {
+        let request = |client: Arc<DualClient>, method: &'static str| {
             let query = query.clone();
             retry_rpc_errors(
                 self.get_strategy(),
@@ -554,18 +862,19 @@ impl RetriableSuiClient {
         limit: Option<usize>,
     ) -> SuiClientResult<ObjectsPage> {
         async fn make_request(
-            client: Arc<SuiClient>,
+            client: Arc<DualClient>,
             address: SuiAddress,
             query: Option<SuiObjectResponseQuery>,
             cursor: Option<ObjectID>,
             limit: Option<usize>,
         ) -> SuiClientResult<ObjectsPage> {
             Ok(client
+                .sui_client()
                 .read_api()
                 .get_owned_objects(address, query, cursor, limit)
                 .await?)
         }
-        let request = |client: Arc<SuiClient>, method: &'static str| {
+        let request = |client: Arc<DualClient>, method: &'static str| {
             let query = query.clone();
             retry_rpc_errors(
                 self.get_strategy(),
@@ -583,27 +892,80 @@ impl RetriableSuiClient {
             .await
     }
 
+    /// Returns a [`sui_types::object::Object`] based on the provided [`ObjectID`].
+    #[tracing::instrument(level = Level::DEBUG, skip(self))]
+    async fn get_object_by_grpc(
+        &self,
+        object_id: ObjectID,
+    ) -> SuiClientResult<sui_types::object::Object> {
+        debug_assert!(self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_OBJECT);
+        async fn make_request(
+            client: Arc<DualClient>,
+            object_id: ObjectID,
+        ) -> SuiClientResult<sui_types::object::Object> {
+            client.get_object(object_id).await
+        }
+
+        let request = move |client: Arc<DualClient>, method| {
+            retry_rpc_errors(
+                self.get_strategy(),
+                move || make_request(client.clone(), object_id),
+                self.metrics.clone(),
+                method,
+            )
+        };
+        self.failover_sui_client
+            .with_failover(request, None, "get_object")
+            .await
+    }
+
+    /// Returns a [`sui_types::object::Object`] based on the provided [`ObjectID`].
+    #[tracing::instrument(level = Level::DEBUG, skip(self))]
+    async fn get_object_ref_with_grpc(&self, object_id: ObjectID) -> SuiClientResult<ObjectRef> {
+        debug_assert!(self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_OBJECT);
+        async fn make_request(
+            client: Arc<DualClient>,
+            object_id: ObjectID,
+        ) -> SuiClientResult<ObjectRef> {
+            client.get_object_ref(object_id).await
+        }
+
+        let request = move |client: Arc<DualClient>, method| {
+            retry_rpc_errors(
+                self.get_strategy(),
+                move || make_request(client.clone(), object_id),
+                self.metrics.clone(),
+                method,
+            )
+        };
+        self.failover_sui_client
+            .with_failover(request, None, "get_object_ref")
+            .await
+    }
+
     /// Returns a [`SuiObjectResponse`] based on the provided [`ObjectID`].
     ///
     /// Calls [`sui_sdk::apis::ReadApi::get_object_with_options`] internally.
     #[tracing::instrument(level = Level::DEBUG, skip(self))]
-    pub async fn get_object_with_options(
+    async fn get_object_with_json_rpc(
         &self,
         object_id: ObjectID,
         options: SuiObjectDataOptions,
     ) -> SuiClientResult<SuiObjectResponse> {
+        debug_assert!(self.grpc_migration_level < GRPC_MIGRATION_LEVEL_GET_OBJECT);
         async fn make_request(
-            client: Arc<SuiClient>,
+            client: Arc<DualClient>,
             object_id: ObjectID,
             options: SuiObjectDataOptions,
         ) -> SuiClientResult<SuiObjectResponse> {
             Ok(client
+                .sui_client()
                 .read_api()
                 .get_object_with_options(object_id, options.clone())
                 .await?)
         }
 
-        let request = move |client: Arc<SuiClient>, method| {
+        let request = move |client: Arc<DualClient>, method| {
             let options = options.clone();
             retry_rpc_errors(
                 self.get_strategy(),
@@ -613,7 +975,33 @@ impl RetriableSuiClient {
             )
         };
         self.failover_sui_client
-            .with_failover(request, None, "get_object")
+            .with_failover(request, None, "get_object_with_options")
+            .await
+    }
+
+    /// Returns a [`Bcs`] based on the provided [`ObjectID`].
+    #[tracing::instrument(level = Level::DEBUG, skip(self))]
+    pub async fn get_object_contents(
+        &self,
+        object_id: ObjectID,
+    ) -> SuiClientResult<(StructTag, Bcs)> {
+        async fn make_request(
+            client: Arc<DualClient>,
+            object_id: ObjectID,
+        ) -> SuiClientResult<(StructTag, Bcs)> {
+            client.get_object_contents(object_id).await
+        }
+
+        let request = move |client: Arc<DualClient>, method| {
+            retry_rpc_errors(
+                self.get_strategy(),
+                move || make_request(client.clone(), object_id),
+                self.metrics.clone(),
+                method,
+            )
+        };
+        self.failover_sui_client
+            .with_failover(request, None, "get_object_contents")
             .await
     }
 
@@ -626,17 +1014,18 @@ impl RetriableSuiClient {
         options: SuiTransactionBlockResponseOptions,
     ) -> SuiClientResult<SuiTransactionBlockResponse> {
         async fn make_request(
-            client: Arc<SuiClient>,
+            client: Arc<DualClient>,
             digest: TransactionDigest,
             options: SuiTransactionBlockResponseOptions,
         ) -> SuiClientResult<SuiTransactionBlockResponse> {
             Ok(client
+                .sui_client()
                 .read_api()
                 .get_transaction_with_options(digest, options.clone())
                 .await?)
         }
 
-        let request = move |client: Arc<SuiClient>, method| {
+        let request = move |client: Arc<DualClient>, method| {
             let options = options.clone();
             retry_rpc_errors(
                 self.get_strategy(),
@@ -650,6 +1039,59 @@ impl RetriableSuiClient {
             .await
     }
 
+    /// Return a list of ObjectRefs from the given vector of [ObjectID]s.
+    #[tracing::instrument(level = Level::DEBUG, skip_all)]
+    pub async fn get_object_refs_with_grpc(
+        &self,
+        object_ids: &[ObjectID],
+    ) -> SuiClientResult<Vec<ObjectRef>> {
+        async fn make_request(
+            client: Arc<DualClient>,
+            object_ids: &[ObjectID],
+        ) -> SuiClientResult<Vec<ObjectRef>> {
+            client.get_object_refs(object_ids).await
+        }
+
+        let request = move |client: Arc<DualClient>, method| {
+            let object_ids = object_ids;
+            retry_rpc_errors(
+                self.get_strategy(),
+                move || make_request(client.clone(), object_ids),
+                self.metrics.clone(),
+                method,
+            )
+        };
+        self.failover_sui_client
+            .with_failover(request, None, "get_object_refs")
+            .await
+    }
+
+    #[tracing::instrument(level = Level::DEBUG, skip_all)]
+    async fn multi_get_objects_bcs_datapacks(
+        &self,
+        object_ids: &[ObjectID],
+    ) -> SuiClientResult<Vec<BcsDatapack>> {
+        async fn make_request(
+            client: Arc<DualClient>,
+            object_ids: &[ObjectID],
+        ) -> SuiClientResult<Vec<BcsDatapack>> {
+            client.multi_get_objects_bcs_datapacks(object_ids).await
+        }
+
+        let request = move |client: Arc<DualClient>, method| {
+            let object_ids = object_ids;
+            retry_rpc_errors(
+                self.get_strategy(),
+                move || make_request(client.clone(), object_ids),
+                self.metrics.clone(),
+                method,
+            )
+        };
+        self.failover_sui_client
+            .with_failover(request, None, "multi_get_objects_bcs_datapacks")
+            .await
+    }
+
     /// Return a list of [SuiObjectResponse] from the given vector of [ObjectID]s.
     ///
     /// Calls [`sui_sdk::apis::ReadApi::multi_get_object_with_options`] internally.
@@ -660,17 +1102,18 @@ impl RetriableSuiClient {
         options: SuiObjectDataOptions,
     ) -> SuiClientResult<Vec<SuiObjectResponse>> {
         async fn make_request(
-            client: Arc<SuiClient>,
+            client: Arc<DualClient>,
             object_ids: &[ObjectID],
             options: SuiObjectDataOptions,
         ) -> SuiClientResult<Vec<SuiObjectResponse>> {
             Ok(client
+                .sui_client()
                 .read_api()
                 .multi_get_object_with_options(object_ids.to_vec(), options)
                 .await?)
         }
 
-        let request = move |client: Arc<SuiClient>, method| {
+        let request = move |client: Arc<DualClient>, method| {
             let object_ids = object_ids;
             let options = options.clone();
             retry_rpc_errors(
@@ -716,16 +1159,17 @@ impl RetriableSuiClient {
         package_id: ObjectID,
     ) -> SuiClientResult<BTreeMap<String, SuiMoveNormalizedModule>> {
         async fn make_request(
-            client: Arc<SuiClient>,
+            client: Arc<DualClient>,
             package_id: ObjectID,
         ) -> SuiClientResult<BTreeMap<String, SuiMoveNormalizedModule>> {
             Ok(client
+                .sui_client()
                 .read_api()
                 .get_normalized_move_modules_by_package(package_id)
                 .await?)
         }
 
-        let request = move |client: Arc<SuiClient>, method| {
+        let request = move |client: Arc<DualClient>, method| {
             retry_rpc_errors(
                 self.get_strategy(),
                 move || make_request(client.clone(), package_id),
@@ -747,13 +1191,17 @@ impl RetriableSuiClient {
         epoch: Option<BigInt<u64>>,
     ) -> SuiClientResult<SuiCommittee> {
         async fn make_request(
-            client: Arc<SuiClient>,
+            client: Arc<DualClient>,
             epoch: Option<BigInt<u64>>,
         ) -> SuiClientResult<SuiCommittee> {
-            Ok(client.governance_api().get_committee_info(epoch).await?)
+            Ok(client
+                .sui_client()
+                .governance_api()
+                .get_committee_info(epoch)
+                .await?)
         }
 
-        let request = move |client: Arc<SuiClient>, method| {
+        let request = move |client: Arc<DualClient>, method| {
             retry_rpc_errors(
                 self.get_strategy(),
                 move || make_request(client.clone(), epoch),
@@ -772,11 +1220,15 @@ impl RetriableSuiClient {
     /// Calls [`sui_sdk::apis::ReadApi::get_reference_gas_price`] internally.
     #[tracing::instrument(level = Level::DEBUG, skip_all)]
     pub async fn get_reference_gas_price(&self) -> SuiClientResult<u64> {
-        async fn make_request(client: Arc<SuiClient>) -> SuiClientResult<u64> {
-            Ok(client.read_api().get_reference_gas_price().await?)
+        async fn make_request(client: Arc<DualClient>) -> SuiClientResult<u64> {
+            Ok(client
+                .sui_client()
+                .read_api()
+                .get_reference_gas_price()
+                .await?)
         }
 
-        let request = move |client: Arc<SuiClient>, method| {
+        let request = move |client: Arc<DualClient>, method| {
             retry_rpc_errors(
                 self.get_strategy(),
                 move || make_request(client.clone()),
@@ -798,14 +1250,18 @@ impl RetriableSuiClient {
     ) -> SuiClientResult<DryRunTransactionBlockResponse> {
         let transaction = Arc::new(transaction);
         async fn make_request(
-            client: Arc<SuiClient>,
+            client: Arc<DualClient>,
             transaction: Arc<TransactionData>,
         ) -> SuiClientResult<DryRunTransactionBlockResponse> {
             let tx = TransactionData::clone(&transaction);
-            Ok(client.read_api().dry_run_transaction_block(tx).await?)
+            Ok(client
+                .sui_client()
+                .read_api()
+                .dry_run_transaction_block(tx)
+                .await?)
         }
 
-        let request = move |client: Arc<SuiClient>, method| {
+        let request = move |client: Arc<DualClient>, method| {
             let transaction = transaction.clone();
             retry_rpc_errors(
                 self.get_strategy(),
@@ -819,14 +1275,14 @@ impl RetriableSuiClient {
             .await
     }
 
-    /// Returns a reference to the current internal [`SuiClient`]. Avoid using this function.
+    /// Returns a reference to the current internal [`DualClient`]. Avoid using this function.
     ///
     // TODO: WAL-778 find callsites to this method, and replace them with implementations that make
     // use of failover, since this call is a cheat to bypass the failover mechanism.
     #[deprecated(
         note = "please implement a full treatment in RetriableSuiClient for your use case"
     )]
-    pub async fn get_current_client(&self) -> Arc<SuiClient> {
+    pub async fn get_current_client(&self) -> Arc<DualClient> {
         self.failover_sui_client
             .get_current_client()
             .await
@@ -841,13 +1297,53 @@ impl RetriableSuiClient {
     where
         U: AssociatedContractStruct,
     {
-        let sui_object_response = self
-            .get_object_with_options(
+        self.get_move_object_from_bcs(object_id, |_, struct_tag, bcs| {
+            get_sui_object_from_bcs::<U>(bcs, struct_tag)
+        })
+        .await
+    }
+
+    /// Returns the Sui Object of type `U` with the provided [`ObjectID`] and a specified conversion
+    /// function.
+    #[tracing::instrument(
+        level = Level::DEBUG, skip_all, fields(object_type = %U::CONTRACT_STRUCT)
+    )]
+    pub async fn get_move_object_from_bcs<F, U>(
+        &self,
+        object_id: ObjectID,
+        conversion_fn: F,
+    ) -> SuiClientResult<U>
+    where
+        U: AssociatedContractStruct,
+        F: FnOnce(ObjectID, &StructTag, &[u8]) -> SuiClientResult<U>,
+    {
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_OBJECT {
+            let (struct_tag, bcs) = self.get_object_contents(object_id).await?;
+            conversion_fn(object_id, &struct_tag, bcs.value())
+        } else {
+            use sui_sdk::rpc_types::SuiData as _;
+            let sui_object_response: SuiObjectResponse = self
+                .get_object_with_json_rpc(
+                    object_id,
+                    SuiObjectDataOptions::new().with_bcs().with_type(),
+                )
+                .await?;
+            let sui_object_data: SuiObjectData = sui_object_response
+                .data
+                .context("missing bcs data on object")?;
+            let sui_raw_move_object = sui_object_data
+                .bcs
+                .as_ref()
+                .ok_or(MoveConversionError::NoBcs)?
+                .try_as_move()
+                .ok_or(MoveConversionError::NotMoveObject)?;
+
+            conversion_fn(
                 object_id,
-                SuiObjectDataOptions::new().with_bcs().with_type(),
+                &sui_raw_move_object.type_,
+                &sui_raw_move_object.bcs_bytes,
             )
-            .await?;
-        get_sui_object_from_object_response(&sui_object_response)
+        }
     }
 
     /// Returns the Sui Objects of type `U` with the provided [`ObjectID`]s.
@@ -858,16 +1354,32 @@ impl RetriableSuiClient {
     where
         U: AssociatedContractStruct,
     {
-        let responses = self
-            .multi_get_object_with_options_batched(
-                object_ids,
-                SuiObjectDataOptions::new().with_bcs().with_type(),
-            )
-            .await?;
-        responses
-            .into_iter()
-            .map(|r| get_sui_object_from_object_response(&r))
-            .collect::<Result<Vec<_>, _>>()
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_BATCH_OBJECTS {
+            let bcs_datapacks = self.multi_get_objects_bcs_datapacks(object_ids).await?;
+            bcs_datapacks
+                .into_iter()
+                .map(|bcs_datapack| {
+                    get_sui_object_from_bcs::<U>(
+                        &bcs_datapack
+                            .bcs
+                            .value
+                            .context("missing bcs data on object")?,
+                        &bcs_datapack.struct_tag,
+                    )
+                })
+                .collect()
+        } else {
+            let responses = self
+                .multi_get_object_with_options_batched(
+                    object_ids,
+                    SuiObjectDataOptions::new().with_bcs().with_type(),
+                )
+                .await?;
+            responses
+                .into_iter()
+                .map(|r| get_sui_object_from_object_response(&r))
+                .collect::<Result<Vec<_>, _>>()
+        }
     }
 
     /// Returns the [`ObjectRef`]s of the Sui Objects with the provided [`ObjectID`]s.
@@ -875,27 +1387,35 @@ impl RetriableSuiClient {
         &self,
         object_ids: &[ObjectID],
     ) -> SuiClientResult<Vec<ObjectRef>> {
-        let responses = self
-            .multi_get_object_with_options_batched(object_ids, SuiObjectDataOptions::new())
-            .await?;
-        responses
-            .into_iter()
-            .map(|r| {
-                Ok(r.into_object()
-                    .map_err(|e| SuiClientError::Internal(e.into()))?
-                    .object_ref())
-            })
-            .collect()
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_BATCH_OBJECTS {
+            self.get_object_refs_with_grpc(object_ids).await
+        } else {
+            let responses = self
+                .multi_get_object_with_options_batched(object_ids, SuiObjectDataOptions::new())
+                .await?;
+            responses
+                .into_iter()
+                .map(|r| {
+                    Ok(r.into_object()
+                        .map_err(|e| SuiClientError::Internal(e.into()))?
+                        .object_ref())
+                })
+                .collect()
+        }
     }
 
     /// Returns the chain identifier.
     ///
     /// Calls [`sui_sdk::apis::ReadApi::get_chain_identifier`] internally.
     pub async fn get_chain_identifier(&self) -> SuiClientResult<String> {
-        async fn make_request(client: Arc<SuiClient>) -> SuiClientResult<String> {
-            Ok(client.read_api().get_chain_identifier().await?)
+        async fn make_request(client: Arc<DualClient>) -> SuiClientResult<String> {
+            Ok(client
+                .sui_client()
+                .read_api()
+                .get_chain_identifier()
+                .await?)
         }
-        let request = move |client: Arc<SuiClient>, method| {
+        let request = move |client: Arc<DualClient>, method| {
             retry_rpc_errors(
                 self.get_strategy(),
                 move || make_request(client.clone()),
@@ -908,37 +1428,24 @@ impl RetriableSuiClient {
             .await
     }
 
-    // Other wrapper methods.
-
-    pub(crate) async fn get_shared_object_initial_version(
+    /// Get the initial version of a shared object.
+    pub async fn get_shared_object_initial_version(
         &self,
         object_id: ObjectID,
     ) -> SuiClientResult<SequenceNumber> {
-        self.get_initial_version_from_object_response(
-            &self
-                .get_object_with_options(object_id, SuiObjectDataOptions::new().with_owner())
-                .await?,
-        )
-    }
-
-    pub(crate) fn get_initial_version_from_object_response(
-        &self,
-        object_response: &SuiObjectResponse,
-    ) -> SuiClientResult<SequenceNumber> {
-        if let Some(Owner::Shared {
-            initial_shared_version,
-        }) = object_response.owner()
-        {
-            Ok(initial_shared_version)
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_OBJECT {
+            get_initial_version_from_grpc_object(&self.get_object_by_grpc(object_id).await?)
         } else {
-            Err(SuiClientError::Internal(anyhow::anyhow!(
-                "trying to get the initial version of a non-shared object; object_id: {:?}",
-                object_response.object_id(),
-            )))
+            get_initial_version_from_object_response(
+                &self
+                    .get_object_with_json_rpc(object_id, SuiObjectDataOptions::new().with_owner())
+                    .await?,
+            )
         }
     }
 
-    pub(crate) async fn get_extended_field<V>(
+    /// Get an extended field value.
+    pub async fn get_extended_field<V>(
         &self,
         object_id: ObjectID,
         type_origin_map: &TypeOriginMap,
@@ -952,8 +1459,8 @@ impl RetriableSuiClient {
             .await
     }
 
-    #[allow(unused)]
-    pub(crate) async fn get_dynamic_field_object<K, V>(
+    /// Returns a dynamic field object.
+    pub async fn get_dynamic_field_object<K, V>(
         &self,
         parent: ObjectID,
         key_type: TypeTag,
@@ -971,7 +1478,8 @@ impl RetriableSuiClient {
         Ok(inner)
     }
 
-    pub(crate) async fn get_dynamic_field<K, V>(
+    /// Returns the value of a dynamic field. Pulls the value out of [`SuiDynamicField`].
+    pub async fn get_dynamic_field<K, V>(
         &self,
         parent: ObjectID,
         key_type: TypeTag,
@@ -992,8 +1500,39 @@ impl RetriableSuiClient {
         Ok(field.value)
     }
 
+    /// Returns the dynamic fields for the object.
+    #[tracing::instrument(level = Level::DEBUG, skip_all)]
+    pub async fn get_dynamic_fields(
+        &self,
+        object_id: ObjectID,
+        cursor: Option<ObjectID>,
+        limit: Option<usize>,
+    ) -> SuiClientResult<Page<DynamicFieldInfo, ObjectID>> {
+        self.failover_sui_client
+            .with_failover(
+                async |client, method| {
+                    retry_rpc_errors(
+                        self.get_strategy(),
+                        || async {
+                            Ok(client
+                                .sui_client()
+                                .read_api()
+                                .get_dynamic_fields(object_id, cursor, limit)
+                                .await?)
+                        },
+                        self.metrics.clone(),
+                        method,
+                    )
+                    .await
+                },
+                None,
+                "get_events",
+            )
+            .await
+    }
+
     /// Checks if the Walrus system object exist on chain and returns the Walrus package ID.
-    pub(crate) async fn get_system_package_id_from_system_object(
+    pub async fn get_system_package_id_from_system_object(
         &self,
         system_object_id: ObjectID,
     ) -> SuiClientResult<ObjectID> {
@@ -1007,7 +1546,7 @@ impl RetriableSuiClient {
 
     /// Checks if the credits object (`subsidies::Subsidies` in Move) exist on chain and returns
     /// the object.
-    pub(crate) async fn get_credits_object(&self, object_id: ObjectID) -> SuiClientResult<Credits> {
+    pub async fn get_credits_object(&self, object_id: ObjectID) -> SuiClientResult<Credits> {
         self.get_sui_object::<Credits>(object_id).await
     }
 
@@ -1018,53 +1557,89 @@ impl RetriableSuiClient {
         &self,
         object_id: ObjectID,
     ) -> SuiClientResult<ObjectID> {
-        let response = self
-            .get_object_with_options(
-                object_id,
-                SuiObjectDataOptions::default().with_type().with_bcs(),
-            )
-            .await
-            .inspect_err(|error| {
-                tracing::debug!(%error, %object_id, "unable to get the object");
-            })?;
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_OBJECT {
+            let object = self
+                .get_object_by_grpc(object_id)
+                .await
+                .inspect_err(|error| {
+                    tracing::debug!(%error, %object_id, "unable to get the object");
+                })?;
 
-        let pkg_id =
-            crate::utils::get_package_id_from_object_response(&response).inspect_err(|error| {
-                tracing::debug!(%error, %object_id, "unable to get the package ID from the object");
-            })?;
-        Ok(pkg_id)
+            let pkg_id =
+                crate::utils::get_package_id_from_object(&object).inspect_err(|error| {
+                    tracing::debug!(%error, %object_id,
+                        "unable to get the package ID from the object");
+                })?;
+            Ok(pkg_id)
+        } else {
+            let object = self
+                .get_object_with_json_rpc(
+                    object_id,
+                    SuiObjectDataOptions::default().with_type().with_bcs(),
+                )
+                .await
+                .inspect_err(|error| {
+                    tracing::debug!(%error, %object_id, "unable to get the object");
+                })?;
+
+            let pkg_id = crate::utils::get_package_id_from_object_response(&object).inspect_err(
+                |error| {
+                    tracing::debug!(%error, %object_id,
+                    "unable to get the package ID from the object response");
+                },
+            )?;
+            Ok(pkg_id)
+        }
     }
 
     /// Gets the type origin map for a given package.
-    pub(crate) async fn type_origin_map_for_package(
+    pub async fn type_origin_map_for_package(
         &self,
         package_id: ObjectID,
     ) -> SuiClientResult<TypeOriginMap> {
-        let Ok(Some(SuiRawData::Package(raw_package))) = self
-            .get_object_with_options(
-                package_id,
-                SuiObjectDataOptions::default().with_type().with_bcs(),
-            )
-            .await?
-            .into_object()
-            .map(|object| object.bcs)
-        else {
-            return Err(SuiClientError::WalrusPackageNotFound(package_id));
-        };
-        Ok(raw_package
-            .type_origin_table
-            .into_iter()
-            .map(|origin| ((origin.module_name, origin.datatype_name), origin.package))
-            .collect())
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_OBJECT {
+            async fn make_request(
+                client: Arc<DualClient>,
+                package_id: ObjectID,
+            ) -> SuiClientResult<TypeOriginMap> {
+                client.get_type_origin_map_for_package(package_id).await
+            }
+
+            let request = move |client: Arc<DualClient>, method| {
+                retry_rpc_errors(
+                    self.get_strategy(),
+                    move || make_request(client.clone(), package_id),
+                    self.metrics.clone(),
+                    method,
+                )
+            };
+            self.failover_sui_client
+                .with_failover(request, None, "type_origin_map_for_package")
+                .await
+        } else {
+            let Ok(Some(SuiRawData::Package(raw_package))) = self
+                .get_object_with_json_rpc(
+                    package_id,
+                    SuiObjectDataOptions::default().with_type().with_bcs(),
+                )
+                .await?
+                .into_object()
+                .map(|object| object.bcs)
+            else {
+                return Err(SuiClientError::WalrusPackageNotFound(package_id));
+            };
+            Ok(raw_package
+                .type_origin_table
+                .into_iter()
+                .map(|origin| ((origin.module_name, origin.datatype_name), origin.package))
+                .collect())
+        }
     }
 
     /// Retrieves the WAL type from the walrus package by getting the type tag of the `Balance`
     /// in the `StakedWal` Move struct.
     #[tracing::instrument(err, skip(self))]
-    pub(crate) async fn wal_type_from_package(
-        &self,
-        package_id: ObjectID,
-    ) -> SuiClientResult<String> {
+    pub async fn wal_type_from_package(&self, package_id: ObjectID) -> SuiClientResult<String> {
         let normalized_move_modules = self
             .get_normalized_move_modules_by_package(package_id)
             .await?;
@@ -1115,7 +1690,7 @@ impl RetriableSuiClient {
     /// If the `gas_budget` is passed in, this returns the gas budget and the current gas price.
     /// Otherwise, it estimates the gas budget and the gas price concurrently.
     #[tracing::instrument(skip_all, level = Level::DEBUG)]
-    pub(crate) async fn gas_budget_and_price(
+    pub async fn gas_budget_and_price(
         &self,
         gas_budget: Option<u64>,
         signer: SuiAddress,
@@ -1175,13 +1750,13 @@ impl RetriableSuiClient {
 
     /// Executes a transaction.
     #[tracing::instrument(level = Level::DEBUG, err, skip(self, transaction))]
-    pub(crate) async fn execute_transaction(
+    pub async fn execute_transaction(
         &self,
         transaction: Transaction,
         method: &'static str,
     ) -> SuiClientResult<SuiTransactionBlockResponse> {
         async fn make_request(
-            client: Arc<SuiClient>,
+            client: Arc<DualClient>,
             transaction: Transaction,
         ) -> SuiClientResult<SuiTransactionBlockResponse> {
             #[cfg(msim)]
@@ -1189,6 +1764,7 @@ impl RetriableSuiClient {
                 maybe_return_injected_error_in_stake_pool_transaction(&transaction)?;
             }
             Ok(client
+                .sui_client()
                 .quorum_driver_api()
                 .execute_transaction_block(
                     transaction.clone(),
@@ -1202,7 +1778,7 @@ impl RetriableSuiClient {
                 )
                 .await?)
         }
-        let request = move |client: Arc<SuiClient>, method| {
+        let request = move |client: Arc<DualClient>, method| {
             let transaction = transaction.clone();
             // Retry here must use the exact same transaction to avoid locked objects.
             retry_rpc_errors(
@@ -1230,7 +1806,13 @@ impl RetriableSuiClient {
                 async |client, method| {
                     retry_rpc_errors(
                         self.get_strategy(),
-                        || async { Ok(client.event_api().get_events(tx_digest).await?) },
+                        || async {
+                            Ok(client
+                                .sui_client()
+                                .event_api()
+                                .get_events(tx_digest)
+                                .await?)
+                        },
                         self.metrics.clone(),
                         method,
                     )
@@ -1242,14 +1824,116 @@ impl RetriableSuiClient {
             .await
     }
 
+    /// Get an object from an [`ObjectID`].
+    #[tracing::instrument(skip(self), level = Level::DEBUG)]
+    pub async fn get_object(
+        &self,
+        object_id: ObjectID,
+    ) -> SuiClientResult<sui_types::object::Object> {
+        async fn make_request(
+            client: Arc<DualClient>,
+            object_id: ObjectID,
+        ) -> SuiClientResult<sui_types::object::Object> {
+            client.get_object(object_id).await
+        }
+
+        let request = move |client: Arc<DualClient>, method| {
+            retry_rpc_errors(
+                self.get_strategy(),
+                move || make_request(client.clone(), object_id),
+                self.metrics.clone(),
+                method,
+            )
+        };
+        self.failover_sui_client
+            .with_failover(request, None, "get_object")
+            .await
+    }
+
     /// Get the latest object reference given an [`ObjectID`].
     #[tracing::instrument(skip(self), level = Level::DEBUG)]
-    pub async fn get_object_ref(&self, object_id: ObjectID) -> Result<ObjectRef, anyhow::Error> {
-        Ok(self
-            .get_object_with_options(object_id, SuiObjectDataOptions::new())
-            .await?
-            .into_object()?
-            .object_ref())
+    pub async fn get_object_ref(&self, object_id: ObjectID) -> SuiClientResult<ObjectRef> {
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_OBJECT {
+            self.get_object_ref_with_grpc(object_id).await
+        } else {
+            let object_data = self
+                .get_object_with_json_rpc(object_id, SuiObjectDataOptions::new().with_type())
+                .await?
+                .data
+                .context("no object data returned")?;
+            let object_ref = object_data.object_ref();
+            Ok(object_ref)
+        }
+    }
+
+    /// Get the latest object reference given an [`ObjectID`].
+    #[tracing::instrument(skip_all, level = Level::DEBUG)]
+    pub async fn get_object_ref_and_type_tag(
+        &self,
+        object_id: ObjectID,
+    ) -> Result<(ObjectRef, TypeTag), SuiClientError> {
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_OBJECT {
+            self.get_object_ref_and_type_tag_with_grpc(object_id).await
+        } else {
+            let object_data = self
+                .get_object_with_json_rpc(object_id, SuiObjectDataOptions::new().with_type())
+                .await?
+                .data
+                .context("no object data returned")?;
+            let ObjectType::Struct(object_type) = object_data.object_type()? else {
+                return Err(anyhow::anyhow!("object is not a struct").into());
+            };
+            let object_ref = object_data.object_ref();
+            Ok((object_ref, object_type.into()))
+        }
+    }
+
+    async fn get_object_ref_and_type_tag_with_grpc(
+        &self,
+        object_id: ObjectID,
+    ) -> Result<(ObjectRef, TypeTag), SuiClientError> {
+        debug_assert!(self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_OBJECT);
+        async fn make_request(
+            client: Arc<DualClient>,
+            object_id: ObjectID,
+        ) -> SuiClientResult<(ObjectRef, TypeTag)> {
+            client.get_object_ref_and_type_tag(object_id).await
+        }
+
+        let request = move |client: Arc<DualClient>, method| {
+            retry_rpc_errors(
+                self.get_strategy(),
+                move || make_request(client.clone(), object_id),
+                self.metrics.clone(),
+                method,
+            )
+        };
+        self.failover_sui_client
+            .with_failover(request, None, "get_object_ref_and_type_tag")
+            .await
+    }
+
+    /// Returns the owner address of the given object.
+    #[tracing::instrument(skip_all, level = Level::DEBUG)]
+    pub async fn get_object_owner_address(
+        &self,
+        object_id: ObjectID,
+    ) -> SuiClientResult<SuiAddress> {
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_OBJECT {
+            let object: sui_types::object::Object = self.get_object_by_grpc(object_id).await?;
+            Ok(object
+                .owner()
+                .get_owner_address()
+                .context("no object owner address returned from rpc")?)
+        } else {
+            let object: SuiObjectResponse = self
+                .get_object_with_json_rpc(object_id, SuiObjectDataOptions::default().with_owner())
+                .await?;
+            Ok(object
+                .owner()
+                .context("no object owner returned from rpc")?
+                .get_owner_address()?)
+        }
     }
 
     /// Returns the node objects for the given node IDs.
@@ -1262,25 +1946,34 @@ impl RetriableSuiClient {
         I: IntoIterator<Item = ObjectID>,
     {
         let node_ids = node_ids.into_iter().collect::<Vec<_>>();
-
-        futures::future::try_join_all(node_ids.chunks(MULTI_GET_OBJ_LIMIT).map(
-            |obj_id_batch| async move {
-                self.multi_get_object_with_options(
-                    obj_id_batch,
-                    SuiObjectDataOptions::new().with_type().with_bcs(),
-                )
-                .await
-            },
-        ))
-        .await?
-        .into_iter()
-        .flat_map(|responses| {
-            responses
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_BATCH_OBJECTS {
+            self.get_sui_objects(&node_ids)
+                .await?
                 .into_iter()
-                .map(|response| get_sui_object_from_object_response::<StakingPool>(&response))
-        })
-        .map(|result| result.map(|pool| (pool.id, pool)))
-        .collect()
+                .map(|pool: StakingPool| Ok((pool.id, pool)))
+                .collect()
+        } else {
+            let sui_object_responses =
+                futures::future::try_join_all(node_ids.chunks(MULTI_GET_OBJ_LIMIT).map(
+                    |obj_id_batch| async move {
+                        self.multi_get_object_with_options(
+                            obj_id_batch,
+                            SuiObjectDataOptions::new().with_type().with_bcs(),
+                        )
+                        .await
+                    },
+                ))
+                .await?;
+            sui_object_responses
+                .into_iter()
+                .flat_map(|responses| {
+                    responses.into_iter().map(|response| {
+                        get_sui_object_from_object_response::<StakingPool>(&response)
+                    })
+                })
+                .map(|result| result.map(|pool| (pool.id, pool)))
+                .collect()
+        }
     }
 
     /// Returns the blob event with the given Event ID.
@@ -1297,11 +1990,10 @@ impl RetriableSuiClient {
     pub async fn get_storage_nodes_by_ids(
         &self,
         node_ids: &[ObjectID],
-    ) -> Result<Vec<StorageNode>, anyhow::Error> {
+    ) -> SuiClientResult<Vec<StorageNode>> {
         Ok(self
             .get_sui_objects::<StakingPool>(node_ids)
-            .await
-            .context("one or multiple node IDs were not found")?
+            .await?
             .into_iter()
             .map(|pool| pool.node_info)
             .collect())
@@ -1320,6 +2012,78 @@ impl RetriableSuiClient {
         .await
         .map(Some)
         .or_else(|_| Ok(None))
+    }
+
+    /// Returns the previous transaction digest for the given object ID.
+    pub async fn get_previous_transaction(
+        &self,
+        object_id: ObjectID,
+    ) -> SuiClientResult<TransactionDigest> {
+        if self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_OBJECT {
+            Ok(self.get_previous_transaction_with_grpc(object_id).await?)
+        } else {
+            Ok(self
+                .get_object_with_json_rpc(
+                    object_id,
+                    SuiObjectDataOptions::new().with_previous_transaction(),
+                )
+                .await?
+                .data
+                .context("missing data on object")?
+                .previous_transaction
+                .context("missing previous transaction on object")?)
+        }
+    }
+
+    async fn get_previous_transaction_with_grpc(
+        &self,
+        object_id: ObjectID,
+    ) -> SuiClientResult<TransactionDigest> {
+        debug_assert!(self.grpc_migration_level >= GRPC_MIGRATION_LEVEL_GET_OBJECT);
+        async fn make_request(
+            client: Arc<DualClient>,
+            object_id: ObjectID,
+        ) -> SuiClientResult<TransactionDigest> {
+            client.get_previous_transaction(object_id).await
+        }
+
+        let request = move |client: Arc<DualClient>, method| {
+            retry_rpc_errors(
+                self.get_strategy(),
+                move || make_request(client.clone(), object_id),
+                self.metrics.clone(),
+                method,
+            )
+        };
+        self.failover_sui_client
+            .with_failover(request, None, "get_previous_transaction")
+            .await
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum Cursor {
+    Init,
+    NextToken(Bytes),
+    Done,
+}
+
+#[derive(Clone)]
+pub(crate) struct StreamState<U> {
+    pub queue: VecDeque<(U, ObjectRef)>,
+    pub cursor: Cursor,
+    pub owner: SuiAddress,
+    pub object_type: String,
+}
+
+impl StreamState<Coin> {
+    pub fn new_with_coin_type(owner: SuiAddress, coin_type: &str) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            cursor: Cursor::Init,
+            owner,
+            object_type: Coin::format_object_type(coin_type),
+        }
     }
 }
 
@@ -1340,7 +2104,7 @@ fn maybe_return_injected_error_in_stake_pool_transaction(
             .transaction_data()
             .move_calls()
             .iter()
-            .any(|(_, _, function_name)| {
+            .any(|(_, _, _, function_name)| {
                 *function_name == crate::contracts::staking::stake_with_pool.name
             });
 

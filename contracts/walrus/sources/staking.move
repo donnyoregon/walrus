@@ -7,10 +7,11 @@ module walrus::staking;
 
 use std::string::String;
 use sui::{balance::Balance, clock::Clock, coin::Coin, dynamic_field as df};
-use wal::wal::WAL;
+use wal::wal::{WAL, ProtectedTreasury};
 use walrus::{
     auth::{Self, Authenticated, Authorized},
     committee::Committee,
+    events,
     node_metadata::NodeMetadata,
     staked_wal::StakedWal,
     staking_inner::{Self, StakingInnerV1},
@@ -130,6 +131,8 @@ public fun collect_commission(
     auth: Authenticated,
     ctx: &mut TxContext,
 ): Coin<WAL> {
+    // TODO(WAL-1147): node operators can only collect commission if the epoch is in
+    // NextParamsSelected.
     staking.inner_mut().collect_commission(node_id, auth).into_coin(ctx)
 }
 
@@ -196,6 +199,15 @@ public fun set_node_capacity_vote(self: &mut Staking, cap: &StorageNodeCap, node
     self.inner_mut().set_node_capacity_vote(cap, node_capacity);
 }
 
+/// Recalculates the quorum storage and write prices from the current committee
+/// and applies them to the system. Should be called after price votes are cast
+/// (in the same PTB) and is also called during epoch change.
+public fun update_prices(staking: &mut Staking, system: &mut System) {
+    let (storage_price, write_price) = staking.inner().recalculate_prices();
+    system.set_storage_price(storage_price);
+    system.set_write_price(write_price);
+}
+
 // === Get/ Update Node Parameters ===
 
 /// Get `NodeMetadata` for the given node.
@@ -249,17 +261,49 @@ public fun voting_end(staking: &mut Staking, clock: &Clock) {
     staking.inner_mut().voting_end(clock)
 }
 
+/// TODO: Deprecated: use `initiate_epoch_change_v2` instead.
+public fun initiate_epoch_change(staking: &mut Staking, system: &mut System, clock: &Clock) {
+    {
+        let staking_inner = staking.inner_mut();
+        let rewards = system.advance_epoch(
+            staking_inner.next_bls_committee(),
+            staking_inner.next_epoch_params(),
+        );
+        staking_inner.initiate_epoch_change(clock, rewards);
+    };
+
+    // Recalculate and apply prices from the new committee.
+    update_prices(staking, system);
+}
+
 /// Initiates the epoch change if the current time allows.
 ///
 /// Emits the `EpochChangeStart` event.
-public fun initiate_epoch_change(staking: &mut Staking, system: &mut System, clock: &Clock) {
-    let staking_inner = staking.inner_mut();
-    let rewards = system.advance_epoch(
-        staking_inner.next_bls_committee(),
-        staking_inner.next_epoch_params(),
-    );
+public fun initiate_epoch_change_v2(
+    staking: &mut Staking,
+    system: &mut System,
+    treasury: &mut ProtectedTreasury,
+    clock: &Clock,
+    ctx: &mut TxContext,
+) {
+    {
+        // Calculate and burn rewards.
+        let burn_balance = system.extract_burn_balance();
+        wal::wal::burn(treasury, burn_balance.into_coin(ctx));
 
-    staking_inner.initiate_epoch_change(clock, rewards);
+        // After this point, the burned reward has been removed from the system's current epoch
+        // reward balance.
+        let staking_inner = staking.inner_mut();
+        let committee_rewards = system.advance_epoch(
+            staking_inner.next_bls_committee(),
+            staking_inner.next_epoch_params(),
+        );
+
+        staking_inner.initiate_epoch_change(clock, committee_rewards);
+    };
+
+    // Recalculate and apply prices from the new committee.
+    update_prices(staking, system);
 }
 
 /// Signals to the contract that the node has received all its shards for the new epoch.
@@ -313,6 +357,18 @@ public fun withdraw_stake(
 /// to the active set either the next time stake is added or by calling this function.
 public fun try_join_active_set(staking: &mut Staking, cap: &StorageNodeCap) {
     staking.inner_mut().try_join_active_set(cap)
+}
+
+/// Burns the commission balance of the pool for the given node.
+/// Used by the slashing mechanism to penalize misbehaving nodes.
+public(package) fun burn_commission(
+    staking: &mut Staking,
+    node_id: ID,
+    treasury: &mut ProtectedTreasury,
+    ctx: &mut TxContext,
+) {
+    let balance = staking.inner_mut().extract_commission_to_burn(node_id);
+    wal::wal::burn(treasury, balance.into_coin(ctx));
 }
 
 /// Adds `commissions[i]` to the commission of pool `node_ids[i]`.

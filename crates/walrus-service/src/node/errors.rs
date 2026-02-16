@@ -16,6 +16,8 @@ use walrus_core::{
     Epoch,
     SUPPORTED_ENCODING_TYPES,
     ShardIndex,
+    SliverIndex,
+    SliverPairIndex,
     encoding::SliverVerificationError,
     inconsistency::InconsistencyVerificationError,
     messages::MessageVerificationError,
@@ -310,6 +312,16 @@ pub enum StoreSliverError {
     #[rest_api_error(reason = "INVALID_SLIVER", status = ApiStatusCode::InvalidArgument)]
     InvalidSliver(#[from] SliverVerificationError),
 
+    /// The sliver's index is inconsistent with the requested sliver pair index.
+    #[error(
+        "sliver index {sliver_index} is inconsistent with sliver pair index {sliver_pair_index}"
+    )]
+    #[rest_api_error(reason = "SLIVER_INDEX_MISMATCH", status = ApiStatusCode::InvalidArgument)]
+    SliverIndexMismatch {
+        sliver_pair_index: SliverPairIndex,
+        sliver_index: SliverIndex,
+    },
+
     #[error(transparent)]
     #[rest_api_error(delegate)]
     ShardNotAssigned(#[from] ShardNotAssigned),
@@ -322,6 +334,11 @@ pub enum StoreSliverError {
     #[error("pending upload cache is saturated; retry once the node catches up")]
     #[rest_api_error(reason = "CACHE_SATURATED", status = ApiStatusCode::FailedPrecondition)]
     CacheSaturated,
+
+    /// The sliver was too large to fit in the pending cache for the node.
+    #[error("pending upload cache rejected sliver; too large for cache")]
+    #[rest_api_error(reason = "SLIVER_TOO_LARGE", status = ApiStatusCode::FailedPrecondition)]
+    SliverTooLarge,
 
     #[error(transparent)]
     #[rest_api_error(delegate)]

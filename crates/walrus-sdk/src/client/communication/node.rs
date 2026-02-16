@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    collections::BTreeMap,
     num::NonZeroU16,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -18,8 +19,9 @@ use walrus_core::{
     PublicKey,
     ShardIndex,
     Sliver,
+    SliverIndex,
     SliverPairIndex,
-    encoding::{EncodingAxis, EncodingConfig, SliverData, SliverPair},
+    encoding::{EitherDecodingSymbol, EncodingAxis, EncodingConfig, SliverData, SliverPair},
     messages::{BlobPersistenceType, SignedStorageConfirmation},
     metadata::VerifiedBlobMetadataWithId,
 };
@@ -28,6 +30,7 @@ use walrus_storage_node_client::{
     StorageNodeClient,
     UploadIntent,
     api::{BlobStatus, StoredOnNodeStatus},
+    client::DecodingSymbolsFilter,
 };
 use walrus_sui::types::StorageNode;
 use walrus_utils::backoff::{self, ExponentialBackoff};
@@ -57,6 +60,7 @@ pub struct NodeResult<T, E> {
 }
 
 impl<T, E> NodeResult<T, E> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         committee_epoch: Epoch,
         weight: usize,
@@ -96,6 +100,7 @@ pub struct NodeCommunication<W = ()> {
     pub client: StorageNodeClient,
     pub config: RequestRateConfig,
     pub sliver_status_check_threshold: usize,
+    pub confirmation_long_poll: Duration,
     pub(crate) auto_tune_handle: Option<AutoTuneHandle>,
     pub(crate) throughput_stats: Arc<Mutex<NodeThroughputStats>>,
     pub node_write_limit: W,
@@ -117,6 +122,7 @@ impl NodeReadCommunication {
     /// Creates a new [`NodeCommunication`].
     ///
     /// Returns `None` if the `node` has no shards.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_index: NodeIndex,
         committee_epoch: Epoch,
@@ -125,6 +131,7 @@ impl NodeReadCommunication {
         encoding_config: Arc<EncodingConfig>,
         config: RequestRateConfig,
         sliver_status_check_threshold: usize,
+        confirmation_long_poll: Duration,
     ) -> Option<Self> {
         if node.shard_ids.is_empty() {
             tracing::debug!("do not create NodeCommunication for node without shards");
@@ -153,6 +160,7 @@ impl NodeReadCommunication {
             config,
             auto_tune_handle: None,
             sliver_status_check_threshold,
+            confirmation_long_poll,
             throughput_stats: Arc::new(Mutex::new(NodeThroughputStats::default())),
             node_write_limit: (),
             sliver_write_limit: (),
@@ -174,6 +182,7 @@ impl NodeReadCommunication {
             client,
             config,
             sliver_status_check_threshold,
+            confirmation_long_poll,
             throughput_stats,
             ..
         } = self;
@@ -187,6 +196,7 @@ impl NodeReadCommunication {
             config,
             auto_tune_handle,
             sliver_status_check_threshold,
+            confirmation_long_poll,
             throughput_stats,
             node_write_limit,
             sliver_write_limit,
@@ -262,6 +272,20 @@ impl<W> NodeCommunication<W> {
         self.to_node_result(1, sliver)
     }
 
+    pub async fn retrieve_decoding_symbols<A: EncodingAxis>(
+        &self,
+        blob_id: &BlobId,
+        target_slivers: &[SliverIndex],
+    ) -> NodeResult<BTreeMap<SliverIndex, Vec<EitherDecodingSymbol>>, NodeError> {
+        tracing::debug!(%blob_id, "retrieving decoding symbols");
+        let filter = DecodingSymbolsFilter {
+            target_slivers: target_slivers.to_vec(),
+            target_type: A::sliver_type(),
+        };
+        let symbols = self.client.list_decoding_symbols(blob_id, &filter).await;
+        self.to_node_result_with_n_shards(symbols)
+    }
+
     /// Requests the status for a blob ID from the node.
     #[tracing::instrument(level = Level::TRACE, parent = &self.span, skip_all)]
     pub async fn get_blob_status(&self, blob_id: &BlobId) -> NodeResult<BlobStatus, NodeError> {
@@ -276,8 +300,12 @@ impl<W> NodeCommunication<W> {
         epoch: Epoch,
         blob_persistence_type: &BlobPersistenceType,
     ) -> Result<SignedStorageConfirmation, NodeError> {
-        let confirmation = backoff::retry(self.backoff_strategy(), || {
-            self.client.get_confirmation(blob_id, blob_persistence_type)
+        let wait_for_registration =
+            (!self.confirmation_long_poll.is_zero()).then_some(self.confirmation_long_poll);
+        let confirmation = backoff::retry(self.backoff_strategy(), || async {
+            self.client
+                .get_confirmation(blob_id, blob_persistence_type, wait_for_registration)
+                .await
         })
         .await
         .map_err(|error| {
