@@ -39,7 +39,7 @@ jobs:
 
       - name: Restore cached sui binary
         id: cache-sui-restore
-        uses: actions/cache/restore@8b402f58fbc84540c8b491a91e594a4576fec3d7 # pin@v5.0.2
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # pin@v5.0.4
         with:
           path: "/home/runner/.cargo/bin/sui"
           key: ${{ runner.os }}-${{ runner.arch }}-${{ env.SUI_TAG }}
