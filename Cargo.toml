@@ -100,7 +100,7 @@ proc-macro2 = "1.0.106"
 prometheus = "0.13.4"
 prost = { version = "0.13", default-features = false }
 quote = "1.0"
-rand = "0.8.5"
+rand = "0.9.2"
 rand_distr = "0.4"
 rayon = "1.11.0"
 rcgen = "0.13.2"
